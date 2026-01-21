@@ -4,7 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from app.core.config import settings
-# No database initialization needed - using ChromaDB via vector_db service
+from app.core.database import init_db, close_db
 from app.api.routes import router
 
 # Configure logging
@@ -19,13 +19,23 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown"""
     # Startup
-    logger.info("Starting Rate Sheet Service (using ChromaDB with BGE embeddings)...")
+    logger.info("Starting Rate Sheet Service (Hybrid Storage: ChromaDB + PostgreSQL)...")
+    try:
+        await init_db()
+        logger.info("✅ Database initialized successfully")
+    except Exception as e:
+        logger.error(f"⚠️  Database initialization failed (non-critical): {e}")
+        logger.info("Continuing with ChromaDB-only mode...")
     logger.info("Rate Sheet Service started successfully")
     
     yield
     
     # Shutdown
     logger.info("Shutting down Rate Sheet Service...")
+    try:
+        await close_db()
+    except Exception as e:
+        logger.error(f"Error closing database: {e}")
     logger.info("Rate Sheet Service shut down")
 
 

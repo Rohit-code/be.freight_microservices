@@ -1,7 +1,8 @@
-"""Rate Sheet Service - stores all data in ChromaDB with BGE embeddings (same as email service)"""
+"""Rate Sheet Service - stores all data in ChromaDB with BGE embeddings + PostgreSQL for structured data"""
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import os
+from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
 import logging
 import numpy as np
@@ -95,7 +96,7 @@ def convert_numpy_types(obj: Any) -> Any:
 
 
 class RateSheetService:
-    """Main service for rate sheet operations - stores everything in ChromaDB (like email service)"""
+    """Main service for rate sheet operations - hybrid storage: ChromaDB (search) + PostgreSQL (structured data)"""
     
     def __init__(self):
         self.excel_parser = ExcelParser()
@@ -104,6 +105,10 @@ class RateSheetService:
         self.rerank_service = RerankService()
         self.upload_dir = settings.UPLOAD_DIR
         os.makedirs(self.upload_dir, exist_ok=True)
+        
+        # Import here to avoid circular imports
+        from app.services.structured_data_service import StructuredDataService
+        self.structured_data_service = StructuredDataService()
     
     async def upload_rate_sheet(
         self,
@@ -168,6 +173,24 @@ class RateSheetService:
                 parsed_data=parsed_data,
                 metadata=metadata
             )
+            
+            # NEW: Store structured data in PostgreSQL for precise querying
+            # This enables exact rate extraction without text parsing
+            try:
+                from app.core.database import AsyncSessionLocal
+                async with AsyncSessionLocal() as db_session:
+                    await self.structured_data_service.store_structured_data(
+                        session=db_session,
+                        rate_sheet_id=rate_sheet_id,
+                        organization_id=organization_id,
+                        user_id=user_id,
+                        file_name=file_name,
+                        structured_data=ai_analysis
+                    )
+                    logger.info(f"✅ Stored structured data in PostgreSQL for rate sheet {rate_sheet_id}")
+            except Exception as structured_error:
+                # Log error but don't fail the upload - ChromaDB storage succeeded
+                logger.error(f"⚠️  Failed to store structured data (non-critical): {structured_error}")
             
             # Convert numpy types to native Python types for JSON serialization
             # Convert ai_analysis and parsed_data to ensure no numpy types

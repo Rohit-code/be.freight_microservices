@@ -14,6 +14,11 @@ logger = logging.getLogger(__name__)
 # Collection name for emails in vector DB
 EMAILS_COLLECTION = "emails"
 
+# Lock dictionary to prevent concurrent storage of the same email
+# Key: email_id, Value: asyncio.Lock
+_email_storage_locks: Dict[str, asyncio.Lock] = {}
+_locks_lock = asyncio.Lock()  # Lock to protect the locks dictionary
+
 
 async def ensure_collection_exists():
     """Ensure the emails collection exists in vector DB"""
@@ -209,34 +214,51 @@ async def store_email(email_data: EmailCreate, organization_id: Optional[int] = 
     """
     logger.info(f"📧 store_email called: gmail_id={email_data.gmail_message_id}, user_id={email_data.user_id}, org_id={organization_id}, auto_draft={auto_draft}")
     
-    try:
-        logger.info("🔍 Ensuring collection exists...")
-        await ensure_collection_exists()
-        
-        # Check if email already exists
-        logger.info(f"🔍 Checking if email {email_data.gmail_message_id} already exists...")
-        existing = await get_email_by_gmail_id(email_data.user_id, email_data.gmail_message_id)
-        if existing:
-            logger.info(f"⚠️  Email {email_data.gmail_message_id} already exists, returning existing")
-            return existing
-        logger.info(f"✅ Email {email_data.gmail_message_id} is new, proceeding with storage")
-        
-        # Get organization_id if not provided and auto_draft is enabled
-        org_id = organization_id
-        logger.info(f"🔍 Organization ID: provided={organization_id}, auto_draft={auto_draft}")
-        
-        if auto_draft and not org_id:
-            logger.info(f"🔍 Attempting to get organization_id for user {email_data.user_id}...")
-            org_id = await get_user_organization_id(email_data.user_id)
-            if not org_id:
-                logger.warning(f"⚠️  Could not get organization_id for user {email_data.user_id}, skipping auto-draft")
-                auto_draft = False
-            else:
-                logger.info(f"✅ Got organization_id: {org_id}")
-        
-        # Generate deterministic ID based on user_id and gmail_message_id
-        # This ensures the same email always gets the same ID, preventing duplicates
-        email_id = _generate_email_id(email_data.user_id, email_data.gmail_message_id)
+    # Generate deterministic ID FIRST (before any checks)
+    # This ensures we use the same ID for duplicate detection
+    email_id = _generate_email_id(email_data.user_id, email_data.gmail_message_id)
+    
+    # Get or create a lock for this specific email_id to prevent race conditions
+    async with _locks_lock:
+        if email_id not in _email_storage_locks:
+            _email_storage_locks[email_id] = asyncio.Lock()
+        lock = _email_storage_locks[email_id]
+    
+    # Acquire lock for this email_id (prevents concurrent storage of same email)
+    async with lock:
+        try:
+            logger.info("🔍 Ensuring collection exists...")
+            await ensure_collection_exists()
+            
+            # Check if email already exists using deterministic ID (atomic check)
+            logger.info(f"🔍 Checking if email {email_data.gmail_message_id} (ID: {email_id}) already exists...")
+            async with httpx.AsyncClient() as client:
+                existing_doc_response = await client.get(
+                    f"{settings.VECTOR_DB_SERVICE_URL}/api/vector/collections/{EMAILS_COLLECTION}/documents/{email_id}",
+                    timeout=30.0
+                )
+                if existing_doc_response.status_code == 200:
+                    # Email already exists - return existing
+                    logger.info(f"⚠️  Email {email_data.gmail_message_id} already exists with ID {email_id}, returning existing")
+                    existing_data = existing_doc_response.json()
+                    existing_metadata = existing_data.get("metadata", {})
+                    existing_document = existing_data.get("document", "")
+                    return _metadata_to_email(email_id, existing_metadata, existing_document)
+            
+            logger.info(f"✅ Email {email_data.gmail_message_id} is new, proceeding with storage")
+            
+            # Get organization_id if not provided and auto_draft is enabled
+            org_id = organization_id
+            logger.info(f"🔍 Organization ID: provided={organization_id}, auto_draft={auto_draft}")
+            
+            if auto_draft and not org_id:
+                logger.info(f"🔍 Attempting to get organization_id for user {email_data.user_id}...")
+                org_id = await get_user_organization_id(email_data.user_id)
+                if not org_id:
+                    logger.warning(f"⚠️  Could not get organization_id for user {email_data.user_id}, skipping auto-draft")
+                    auto_draft = False
+                else:
+                    logger.info(f"✅ Got organization_id: {org_id}")
         
         # Store email first, then draft response asynchronously (non-blocking)
         # This ensures emails are always stored even if drafting takes a long time
@@ -257,90 +279,69 @@ async def store_email(email_data: EmailCreate, organization_id: Optional[int] = 
         else:
             logger.info(f"ℹ️  Skipping auto-draft (auto_draft={auto_draft}, org_id={org_id})")
         
-        # Create full raw email content as a structured string
-        # Store complete email content for both retrieval and semantic search
-        # Format: All email fields including full body (both HTML and plain)
-        raw_email_content_parts = []
-        if email_data.subject:
-            raw_email_content_parts.append(f"Subject: {email_data.subject}")
-        if email_data.from_email:
-            raw_email_content_parts.append(f"From: {email_data.from_email}")
-        if email_data.to_email:
-            raw_email_content_parts.append(f"To: {email_data.to_email}")
-        if email_data.cc_email:
-            raw_email_content_parts.append(f"CC: {email_data.cc_email}")
-        if email_data.bcc_email:
-            raw_email_content_parts.append(f"BCC: {email_data.bcc_email}")
-        if email_data.date:
-            raw_email_content_parts.append(f"Date: {email_data.date}")
-        raw_email_content_parts.append("")  # Separator
-        if email_data.body_plain:
-            raw_email_content_parts.append(f"Body (Plain):\n{email_data.body_plain}")
-        if email_data.body_html:
-            raw_email_content_parts.append(f"Body (HTML):\n{email_data.body_html}")
-        if email_data.snippet:
-            raw_email_content_parts.append(f"Snippet: {email_data.snippet}")
-        
-        # Full raw email content as document (for retrieval + embeddings)
-        raw_email_content = "\n".join(raw_email_content_parts)
-        
-        # Create metadata (including drafted response if available)
-        metadata = _email_to_metadata(email_data, email_id, drafted_response)
-        
-        async with httpx.AsyncClient() as client:
-            # Check if document with this ID already exists (atomic check)
-            try:
-                existing_doc_response = await client.get(
-                    f"{settings.VECTOR_DB_SERVICE_URL}/api/vector/collections/{EMAILS_COLLECTION}/documents/{email_id}",
-                    timeout=30.0
+            # Create full raw email content as a structured string
+            # Store complete email content for both retrieval and semantic search
+            # Format: All email fields including full body (both HTML and plain)
+            raw_email_content_parts = []
+            if email_data.subject:
+                raw_email_content_parts.append(f"Subject: {email_data.subject}")
+            if email_data.from_email:
+                raw_email_content_parts.append(f"From: {email_data.from_email}")
+            if email_data.to_email:
+                raw_email_content_parts.append(f"To: {email_data.to_email}")
+            if email_data.cc_email:
+                raw_email_content_parts.append(f"CC: {email_data.cc_email}")
+            if email_data.bcc_email:
+                raw_email_content_parts.append(f"BCC: {email_data.bcc_email}")
+            if email_data.date:
+                raw_email_content_parts.append(f"Date: {email_data.date}")
+            raw_email_content_parts.append("")  # Separator
+            if email_data.body_plain:
+                raw_email_content_parts.append(f"Body (Plain):\n{email_data.body_plain}")
+            if email_data.body_html:
+                raw_email_content_parts.append(f"Body (HTML):\n{email_data.body_html}")
+            if email_data.snippet:
+                raw_email_content_parts.append(f"Snippet: {email_data.snippet}")
+            
+            # Full raw email content as document (for retrieval + embeddings)
+            raw_email_content = "\n".join(raw_email_content_parts)
+            
+            # Create metadata (including drafted response if available)
+            metadata = _email_to_metadata(email_data, email_id, drafted_response)
+            
+            # Store the email (vector DB's add method handles upsert, so duplicates are safe)
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{settings.VECTOR_DB_SERVICE_URL}/api/vector/collections/{EMAILS_COLLECTION}/documents",
+                    json={
+                        "documents": [raw_email_content],  # Full raw email content
+                        "metadatas": [metadata],  # Metadata with all email fields + draft
+                        "ids": [email_id]  # Deterministic ID ensures upsert behavior
+                    },
+                    timeout=60.0  # Longer timeout for embedding generation
                 )
-                if existing_doc_response.status_code == 200:
-                    # Document already exists - return existing instead of creating duplicate
-                    logger.info(f"⚠️  Email {email_data.gmail_message_id} already exists with ID {email_id}, returning existing")
-                    existing_data = existing_doc_response.json()
-                    existing_metadata = existing_data.get("metadata", {})
-                    existing_document = existing_data.get("document", "")
-                    return _metadata_to_email(email_id, existing_metadata, existing_document)
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code != 404:
-                    # Some other error occurred, log it but continue
-                    logger.warning(f"Error checking for existing document: {e}")
-            except Exception as e:
-                logger.warning(f"Error checking for existing document: {e}, continuing with storage...")
-            
-            # Document doesn't exist, proceed with storage
-            # Store the full raw email content as the document
-            # Vector DB will:
-            # 1. Store the raw email text (for retrieval)
-            # 2. Generate embeddings from it (for semantic search)
-            # 3. Store metadata (for filtering and additional info)
-            response = await client.post(
-                f"{settings.VECTOR_DB_SERVICE_URL}/api/vector/collections/{EMAILS_COLLECTION}/documents",
-                json={
-                    "documents": [raw_email_content],  # Full raw email content
-                    "metadatas": [metadata],  # Metadata with all email fields + draft
-                    "ids": [email_id]
-                },
-                timeout=60.0  # Longer timeout for embedding generation
-            )
-            
-            logger.info(f"📤 Storing email in ChromaDB (ID: {email_id})...")
-            if response.status_code == 200:
-                success_msg = f"✅ Stored email {email_data.gmail_message_id} with ID {email_id}"
-                if drafted_response:
-                    success_msg += " with auto-drafted response"
-                logger.info(success_msg)
-                stored_email = _metadata_to_email(email_id, metadata, raw_email_content)
-                # drafted_response is already included in the Email model via _metadata_to_email
-                return stored_email
-            else:
-                error_text = response.text[:500] if hasattr(response, 'text') else "No error text"
-                logger.error(f"❌ Failed to store email in ChromaDB: HTTP {response.status_code} - {error_text}")
-                return None
                 
-    except Exception as e:
-        logger.error(f"❌ Error storing email: {e}", exc_info=True)
-        return None
+                logger.info(f"📤 Storing email in ChromaDB (ID: {email_id})...")
+                if response.status_code == 200:
+                    success_msg = f"✅ Stored email {email_data.gmail_message_id} with ID {email_id}"
+                    if drafted_response:
+                        success_msg += " with auto-drafted response"
+                    logger.info(success_msg)
+                    stored_email = _metadata_to_email(email_id, metadata, raw_email_content)
+                    # drafted_response is already included in the Email model via _metadata_to_email
+                    return stored_email
+                else:
+                    error_text = response.text[:500] if hasattr(response, 'text') else "No error text"
+                    logger.error(f"❌ Failed to store email in ChromaDB: HTTP {response.status_code} - {error_text}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"❌ Error storing email: {e}", exc_info=True)
+            return None
+        finally:
+            # Clean up lock after a delay to prevent memory leak (locks are per-email-id)
+            # Note: We keep locks in memory but they're lightweight. In production, consider using Redis for distributed locks
+            pass
 
 
 def _generate_email_id(user_id: int, gmail_message_id: str) -> str:

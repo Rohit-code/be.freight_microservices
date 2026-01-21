@@ -1,6 +1,16 @@
 from pydantic_settings import BaseSettings
 from pydantic import ConfigDict
 from typing import Optional
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Get microservices root directory (2 levels up from this file)
+MICROSERVICES_ROOT = Path(__file__).parent.parent.parent.parent
+ENV_FILE = MICROSERVICES_ROOT / ".env"
+
+# Load .env file from microservices root
+if ENV_FILE.exists():
+    load_dotenv(ENV_FILE)
 
 
 class Settings(BaseSettings):
@@ -11,7 +21,26 @@ class Settings(BaseSettings):
     PORT: int = 8010
     DEBUG: bool = False
     
-    # No PostgreSQL database - all data stored in ChromaDB via vector_db service
+    # PostgreSQL Database Configuration (for structured rate sheet data)
+    DB_HOST: str = "localhost"
+    DB_PORT: int = 5432
+    DB_USER: str = "postgres"
+    DB_PASSWORD: str = "postgres"
+    
+    @property
+    def DB_NAME(self) -> str:
+        """Service-specific database name"""
+        return "rate_sheet_service_db"
+    
+    @property
+    def DATABASE_URL(self) -> str:
+        """Construct async PostgreSQL database URL"""
+        return f"postgresql+asyncpg://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+    
+    @property
+    def DATABASE_URL_SYNC(self) -> str:
+        """Construct sync PostgreSQL database URL (for Alembic)"""
+        return f"postgresql://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
     
     # AI Service Configuration
     AI_SERVICE_URL: str = "http://localhost:8003"
