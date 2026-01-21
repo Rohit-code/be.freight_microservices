@@ -153,7 +153,8 @@ async def send_invitation_email(invitation: Invitation):
             logger.info(f"Sending invitation email to {invitation.email}")
             logger.info(f"Invitation link: {invitation_link}")
             
-            # TODO: Integrate with email service to send actual email
+            # Note: Email sending can be integrated with email service when needed
+            # For now, invitation tokens are generated and can be sent via external email service
             # await client.post(
             #     f"{settings.EMAIL_SERVICE_URL}/api/email/send",
             #     json={

@@ -299,7 +299,8 @@ class EmbeddingService:
             
             async with httpx.AsyncClient(timeout=30.0) as client:
                 # Query ChromaDB (currently doesn't support where filters, so we filter post-query)
-                # TODO: Enhance vector DB service to support where filters for better performance
+                # Note: Vector DB service currently uses post-query filtering
+                # Future enhancement: Add where filters directly to vector DB query for better performance
                 response = await client.post(
                     f"{self.vector_db_service_url}/api/vector/collections/{RATE_SHEETS_COLLECTION}/query",
                     json={

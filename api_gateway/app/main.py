@@ -4,7 +4,21 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import json
 import logging
+import sys
+from pathlib import Path
 from app.core.config import settings
+from app.utils.proxy import proxy_request
+
+# Try to import shared error handlers
+SHARED_PATH = Path(__file__).parent.parent.parent.parent / "shared"
+if str(SHARED_PATH) not in sys.path:
+    sys.path.insert(0, str(SHARED_PATH))
+
+try:
+    from error_handlers import register_error_handlers
+    ERROR_HANDLERS_AVAILABLE = True
+except ImportError:
+    ERROR_HANDLERS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +27,10 @@ app = FastAPI(
     description="API Gateway for Freight Forwarder Microservices",
     version="1.0.0"
 )
+
+# Register error handlers if available
+if ERROR_HANDLERS_AVAILABLE:
+    register_error_handlers(app)
 
 # CORS middleware
 app.add_middleware(
@@ -47,8 +65,10 @@ async def root_handler(request: Request):
     body = await request.body()
     try:
         body_json = json.loads(body) if body else {}
-    except:
-        body_json = {"raw": body.decode()[:200] if body else ""}
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        # Log decode error but continue - this is expected for non-JSON requests
+        logger.debug(f"Could not decode request body as JSON: {e}")
+        body_json = {"raw": body.decode(errors='replace')[:200] if body else ""}
     
     logger.info(f"Request body: {json.dumps(body_json)[:500]}")
     
@@ -99,333 +119,57 @@ async def root_handler(request: Request):
 @app.api_route("/api/rate-sheets", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_rate_sheets_root(request: Request):
     """Proxy requests to Rate Sheet service root endpoint"""
-    try:
-        url = f"{settings.RATE_SHEET_SERVICE_URL}/api/rate-sheets"
-        
-        # Get request body if present
-        body = None
-        if request.method in ["POST", "PUT", "PATCH"]:
-            body = await request.body()
-        
-        # Forward headers (excluding host and connection)
-        headers = dict(request.headers)
-        headers.pop("host", None)
-        headers.pop("connection", None)
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.request(
-                method=request.method,
-                url=url,
-                headers=headers,
-                content=body,
-                params=dict(request.query_params),
-                timeout=60.0
-            )
-            
-            return Response(
-                content=response.content,
-                status_code=response.status_code,
-                headers=dict(response.headers)
-            )
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=503, detail=f"Rate sheet service unavailable: {str(e)}")
+    url = f"{settings.RATE_SHEET_SERVICE_URL}/api/rate-sheets"
+    return await proxy_request(request, url, "Rate Sheet Service")
 
 
 @app.api_route("/api/auth/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_authentication(request: Request, path: str):
     """Proxy requests to authentication service"""
     url = f"{settings.AUTHENTICATION_SERVICE_URL}/api/auth/{path}"
-    try:
-        
-        # Get request body if present
-        body = None
-        if request.method in ["POST", "PUT", "PATCH"]:
-            body = await request.body()
-        
-        # Forward headers (excluding host and connection)
-        headers = dict(request.headers)
-        headers.pop("host", None)
-        headers.pop("connection", None)
-        
-        # Use longer timeout for webhook endpoints that trigger email processing
-        # Webhook → Email Store → Auto-draft can take time
-        timeout_duration = 180.0 if "/gmail/webhook" in str(request.url) else 60.0
-        
-        async with httpx.AsyncClient(follow_redirects=False) as client:
-            try:
-                response = await client.request(
-                    method=request.method,
-                    url=url,
-                    headers=headers,
-                    content=body,
-                    params=dict(request.query_params),
-                    timeout=timeout_duration
-                )
-                
-                # Filter out headers that shouldn't be forwarded
-                response_headers = dict(response.headers)
-                response_headers.pop("content-encoding", None)
-                response_headers.pop("transfer-encoding", None)
-                response_headers.pop("content-length", None)
-                
-                if response.status_code in {401, 403}:
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    logger.warning(
-                        "Auth service returned %s for %s: %s",
-                        response.status_code,
-                        url,
-                        response.text,
-                    )
-                
-                return Response(
-                    content=response.content,
-                    status_code=response.status_code,
-                    headers=response_headers,
-                    media_type=response.headers.get("content-type")
-                )
-            except httpx.ConnectError as e:
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.error(f"Connection error to authentication service at {url}: {e}")
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Authentication service unavailable: Connection refused. Is the service running on port 8001?"
-                )
-            except httpx.TimeoutException as e:
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.error(f"Timeout connecting to authentication service at {url}: {e}")
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Authentication service unavailable: Request timeout"
-                )
-    except httpx.RequestError as e:
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.error(f"Request error proxying to authentication service at {url}: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=503,
-            detail=f"Authentication service unavailable: {type(e).__name__}: {str(e)}"
-        )
-    except Exception as e:
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.error(f"Unexpected error proxying to authentication service: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=503,
-            detail=f"Authentication service unavailable: {type(e).__name__}: {str(e)}"
-        )
+    return await proxy_request(request, url, "Authentication Service", follow_redirects=False)
 
 
 @app.api_route("/api/constants/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_constants(request: Request, path: str):
     """Proxy requests to constants service"""
-    try:
-        url = f"{settings.CONSTANTS_SERVICE_URL}/api/constants/{path}"
-        
-        # Get request body if present
-        body = None
-        if request.method in ["POST", "PUT", "PATCH"]:
-            body = await request.body()
-        
-        # Forward headers (excluding host and connection)
-        headers = dict(request.headers)
-        headers.pop("host", None)
-        headers.pop("connection", None)
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.request(
-                method=request.method,
-                url=url,
-                headers=headers,
-                content=body,
-                params=dict(request.query_params),
-                timeout=30.0
-            )
-            
-            return Response(
-                content=response.content,
-                status_code=response.status_code,
-                headers=dict(response.headers)
-            )
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=503, detail=f"Constants service unavailable: {str(e)}")
+    url = f"{settings.CONSTANTS_SERVICE_URL}/api/constants/{path}"
+    return await proxy_request(request, url, "Constants Service", default_timeout=30.0)
 
 
 @app.api_route("/api/ai/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_ai(request: Request, path: str):
     """Proxy requests to AI service"""
-    try:
-        url = f"{settings.AI_SERVICE_URL}/api/ai/{path}"
-        
-        # Get request body if present
-        body = None
-        if request.method in ["POST", "PUT", "PATCH"]:
-            body = await request.body()
-        
-        # Forward headers (excluding host and connection)
-        headers = dict(request.headers)
-        headers.pop("host", None)
-        headers.pop("connection", None)
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.request(
-                method=request.method,
-                url=url,
-                headers=headers,
-                content=body,
-                params=dict(request.query_params),
-                timeout=60.0
-            )
-            
-            return Response(
-                content=response.content,
-                status_code=response.status_code,
-                headers=dict(response.headers)
-            )
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=503, detail=f"AI service unavailable: {str(e)}")
+    url = f"{settings.AI_SERVICE_URL}/api/ai/{path}"
+    return await proxy_request(request, url, "AI Service")
 
 
 @app.api_route("/api/vector/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_vector_db(request: Request, path: str):
     """Proxy requests to Vector DB service"""
-    try:
-        url = f"{settings.VECTOR_DB_SERVICE_URL}/api/vector/{path}"
-        
-        # Get request body if present
-        body = None
-        if request.method in ["POST", "PUT", "PATCH"]:
-            body = await request.body()
-        
-        # Forward headers (excluding host and connection)
-        headers = dict(request.headers)
-        headers.pop("host", None)
-        headers.pop("connection", None)
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.request(
-                method=request.method,
-                url=url,
-                headers=headers,
-                content=body,
-                params=dict(request.query_params),
-                timeout=60.0
-            )
-            
-            return Response(
-                content=response.content,
-                status_code=response.status_code,
-                headers=dict(response.headers)
-            )
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=503, detail=f"Vector DB service unavailable: {str(e)}")
+    url = f"{settings.VECTOR_DB_SERVICE_URL}/api/vector/{path}"
+    return await proxy_request(request, url, "Vector DB Service")
 
 
 @app.api_route("/api/email/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_email(request: Request, path: str):
     """Proxy requests to Email service"""
-    try:
-        url = f"{settings.EMAIL_SERVICE_URL}/api/email/{path}"
-        
-        # Get request body if present
-        body = None
-        if request.method in ["POST", "PUT", "PATCH"]:
-            body = await request.body()
-        
-        # Forward headers (excluding host and connection)
-        headers = dict(request.headers)
-        headers.pop("host", None)
-        headers.pop("connection", None)
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.request(
-                method=request.method,
-                url=url,
-                headers=headers,
-                content=body,
-                params=dict(request.query_params),
-                timeout=60.0
-            )
-            
-            return Response(
-                content=response.content,
-                status_code=response.status_code,
-                headers=dict(response.headers)
-            )
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=503, detail=f"Email service unavailable: {str(e)}")
+    url = f"{settings.EMAIL_SERVICE_URL}/api/email/{path}"
+    return await proxy_request(request, url, "Email Service")
 
 
 @app.api_route("/api/user/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_user(request: Request, path: str):
     """Proxy requests to User service"""
-    try:
-        url = f"{settings.USER_SERVICE_URL}/api/user/{path}"
-        
-        # Get request body if present
-        body = None
-        if request.method in ["POST", "PUT", "PATCH"]:
-            body = await request.body()
-        
-        # Forward headers (excluding host and connection)
-        headers = dict(request.headers)
-        headers.pop("host", None)
-        headers.pop("connection", None)
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.request(
-                method=request.method,
-                url=url,
-                headers=headers,
-                content=body,
-                params=dict(request.query_params),
-                timeout=60.0
-            )
-            
-            return Response(
-                content=response.content,
-                status_code=response.status_code,
-                headers=dict(response.headers)
-            )
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=503, detail=f"User service unavailable: {str(e)}")
+    url = f"{settings.USER_SERVICE_URL}/api/user/{path}"
+    return await proxy_request(request, url, "User Service")
 
 
 @app.api_route("/api/rate-sheets/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_rate_sheets(request: Request, path: str):
     """Proxy requests to Rate Sheet service"""
-    try:
-        url = f"{settings.RATE_SHEET_SERVICE_URL}/api/rate-sheets/{path}"
-        
-        # Get request body if present
-        body = None
-        if request.method in ["POST", "PUT", "PATCH"]:
-            body = await request.body()
-        
-        # Forward headers (excluding host and connection)
-        headers = dict(request.headers)
-        headers.pop("host", None)
-        headers.pop("connection", None)
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.request(
-                method=request.method,
-                url=url,
-                headers=headers,
-                content=body,
-                params=dict(request.query_params),
-                timeout=60.0
-            )
-            
-            return Response(
-                content=response.content,
-                status_code=response.status_code,
-                headers=dict(response.headers)
-            )
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=503, detail=f"Rate sheet service unavailable: {str(e)}")
+    url = f"{settings.RATE_SHEET_SERVICE_URL}/api/rate-sheets/{path}"
+    return await proxy_request(request, url, "Rate Sheet Service")
 
 
 if __name__ == "__main__":

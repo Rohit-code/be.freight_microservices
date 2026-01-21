@@ -1,6 +1,8 @@
 from fastapi import APIRouter, Header, HTTPException, status, Request, Response, Query
 from fastapi.responses import RedirectResponse
 from typing import Optional
+import uuid
+import json
 from ..schemas import (
     AuthResponse,
     LoginRequest,
@@ -847,14 +849,36 @@ async def gmail_webhook(request: Request):
         return {"status": "ok"}
         
     except json.JSONDecodeError as e:
-        logger.error(f"❌ JSON decode error: {e}")
-        logger.error(f"Raw body: {await request.body()}")
-        return {"status": "error", "message": f"JSON decode error: {str(e)}"}
+        # Log JSON decode error with context (no silent failure)
+        error_id = str(uuid.uuid4())
+        raw_body = await request.body()
+        logger.error(
+            f"[{error_id}] JSON decode error: {str(e)}",
+            exc_info=True,
+            extra={
+                "error_id": error_id,
+                "raw_body_preview": raw_body[:500] if raw_body else None,
+                "exception_type": "JSONDecodeError"
+            }
+        )
+        # Return 200 to prevent Pub/Sub retries (but log the error)
+        return {"status": "error", "message": f"JSON decode error: {str(e)}", "error_id": error_id}
     except Exception as e:
-        logger.error(f"❌ Gmail webhook error: {str(e)}", exc_info=True)
-        # Still return 200 to prevent Pub/Sub retries
+        # Log webhook error with full context (no silent failure per BACKEND_REVIEW.md)
+        error_id = str(uuid.uuid4())
+        logger.error(
+            f"[{error_id}] Gmail webhook error: {type(e).__name__}: {str(e)}",
+            exc_info=True,
+            extra={
+                "error_id": error_id,
+                "path": str(request.url.path),
+                "method": request.method,
+                "exception_type": type(e).__name__
+            }
+        )
+        # Still return 200 to prevent Pub/Sub retries (but error is logged)
         logger.info("=" * 80)
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": str(e), "error_id": error_id}
 
 
 @router.post("/gmail/watch/start")

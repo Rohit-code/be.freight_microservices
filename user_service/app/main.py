@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 import logging
+import sys
+from pathlib import Path
 from .api.routes import router as user_router, internal_router
 from .core.database import init_db, close_db
 from .services.role_service import initialize_default_roles
@@ -9,6 +11,19 @@ from .services.role_service import initialize_default_roles
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
 logging.getLogger("sqlalchemy.dialects").setLevel(logging.WARNING)
+
+# Try to import shared error handlers
+SHARED_PATH = Path(__file__).parent.parent.parent.parent / "shared"
+if str(SHARED_PATH) not in sys.path:
+    sys.path.insert(0, str(SHARED_PATH))
+
+try:
+    from error_handlers import register_error_handlers
+    ERROR_HANDLERS_AVAILABLE = True
+except ImportError:
+    ERROR_HANDLERS_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.warning("Shared error handlers not available, using default FastAPI error handling")
 
 
 @asynccontextmanager
@@ -27,6 +42,10 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+# Register error handlers if available
+if ERROR_HANDLERS_AVAILABLE:
+    register_error_handlers(app)
 
 app.include_router(user_router)
 app.include_router(internal_router)

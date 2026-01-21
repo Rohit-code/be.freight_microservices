@@ -16,8 +16,10 @@ EMAILS_COLLECTION = "emails"
 
 # Lock dictionary to prevent concurrent storage of the same email
 # Key: email_id, Value: asyncio.Lock
+# Note: Locks are cleaned up after use to prevent memory leaks
 _email_storage_locks: Dict[str, asyncio.Lock] = {}
 _locks_lock = asyncio.Lock()  # Lock to protect the locks dictionary
+_MAX_LOCKS = 1000  # Maximum number of locks to keep in memory
 
 
 async def ensure_collection_exists():
@@ -44,8 +46,10 @@ def _metadata_to_email(doc_id: str, metadata: Dict[str, Any], content: str = "")
         import json
         try:
             drafted_response = json.loads(metadata.get("drafted_response"))
-        except:
-            pass
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            # Log but don't fail - invalid JSON in metadata is non-critical
+            logger.debug(f"Could not parse drafted_response JSON for email {doc_id}: {e}")
+            drafted_response = None
     
     email = Email(
         id=doc_id,
@@ -160,13 +164,38 @@ async def draft_email_response_auto(email_data: EmailCreate, organization_id: in
                 return None
                 
     except httpx.ReadTimeout:
-        logger.warning(f"Auto-draft timeout for email {email_data.gmail_message_id} - draft generation took too long. Email will be stored without draft.")
+        # Log timeout with context (no silent failure per BACKEND_REVIEW.md)
+        logger.warning(
+            f"Auto-draft timeout for email {email_data.gmail_message_id} - draft generation took too long. Email will be stored without draft.",
+            extra={
+                "gmail_message_id": email_data.gmail_message_id,
+                "organization_id": organization_id,
+                "exception_type": "ReadTimeout"
+            }
+        )
         return None
     except httpx.TimeoutException:
-        logger.warning(f"Auto-draft timeout for email {email_data.gmail_message_id} - request timed out. Email will be stored without draft.")
+        # Log timeout with context (no silent failure)
+        logger.warning(
+            f"Auto-draft timeout for email {email_data.gmail_message_id} - request timed out. Email will be stored without draft.",
+            extra={
+                "gmail_message_id": email_data.gmail_message_id,
+                "organization_id": organization_id,
+                "exception_type": "TimeoutException"
+            }
+        )
         return None
     except Exception as e:
-        logger.error(f"Error auto-drafting response for email {email_data.gmail_message_id}: {e}", exc_info=True)
+        # Log error with full context (no silent failure per BACKEND_REVIEW.md)
+        logger.error(
+            f"Error auto-drafting response for email {email_data.gmail_message_id}: {type(e).__name__}: {str(e)}",
+            exc_info=True,
+            extra={
+                "gmail_message_id": email_data.gmail_message_id,
+                "organization_id": organization_id,
+                "exception_type": type(e).__name__
+            }
+        )
         return None
 
 
@@ -174,6 +203,8 @@ async def _draft_and_update_email_async(email_id: str, email_data: EmailCreate, 
     """
     Async helper function to draft email response and update stored email
     This runs in the background so email storage is not blocked
+    
+    Per BACKEND_REVIEW.md: Background tasks should not fail silently
     """
     try:
         logger.info(f"🔄 Background: Starting async draft for email {email_id}")
@@ -189,11 +220,39 @@ async def _draft_and_update_email_async(email_id: str, email_data: EmailCreate, 
             if success:
                 logger.info(f"✅ Background: Successfully updated email {email_id} with draft response")
             else:
-                logger.warning(f"⚠️  Background: Failed to update email {email_id} metadata with draft")
+                # Log failure with context (no silent failure)
+                logger.warning(
+                    f"⚠️  Background: Failed to update email {email_id} metadata with draft",
+                    extra={
+                        "email_id": email_id,
+                        "gmail_message_id": email_data.gmail_message_id,
+                        "organization_id": organization_id
+                    }
+                )
         else:
-            logger.warning(f"⚠️  Background: Draft returned None for email {email_id}")
+            # Log when draft returns None (no silent failure)
+            logger.warning(
+                f"⚠️  Background: Draft returned None for email {email_id}",
+                extra={
+                    "email_id": email_id,
+                    "gmail_message_id": email_data.gmail_message_id,
+                    "organization_id": organization_id
+                }
+            )
     except Exception as e:
-        logger.error(f"❌ Background: Error in async draft/update for email {email_id}: {e}", exc_info=True)
+        # Log background task errors with full context (no silent failures per BACKEND_REVIEW.md)
+        logger.error(
+            f"❌ Background: Error in async draft/update for email {email_id}: {type(e).__name__}: {str(e)}",
+            exc_info=True,
+            extra={
+                "email_id": email_id,
+                "gmail_message_id": email_data.gmail_message_id,
+                "organization_id": organization_id,
+                "exception_type": type(e).__name__
+            }
+        )
+        # Don't re-raise - background task failures shouldn't crash the service
+        # But error is logged for monitoring/debugging
 
 
 async def store_email(email_data: EmailCreate, organization_id: Optional[int] = None, auto_draft: bool = True) -> Optional[Email]:
@@ -221,6 +280,13 @@ async def store_email(email_data: EmailCreate, organization_id: Optional[int] = 
     # Get or create a lock for this specific email_id to prevent race conditions
     async with _locks_lock:
         if email_id not in _email_storage_locks:
+            # Clean up old locks if we're approaching the limit
+            if len(_email_storage_locks) >= _MAX_LOCKS:
+                # Remove oldest 10% of locks (simple cleanup strategy)
+                keys_to_remove = list(_email_storage_locks.keys())[:max(1, _MAX_LOCKS // 10)]
+                for key in keys_to_remove:
+                    _email_storage_locks.pop(key, None)
+                logger.debug(f"Cleaned up {len(keys_to_remove)} old locks from memory")
             _email_storage_locks[email_id] = asyncio.Lock()
         lock = _email_storage_locks[email_id]
     
@@ -259,26 +325,26 @@ async def store_email(email_data: EmailCreate, organization_id: Optional[int] = 
                     auto_draft = False
                 else:
                     logger.info(f"✅ Got organization_id: {org_id}")
-        
-        # Store email first, then draft response asynchronously (non-blocking)
-        # This ensures emails are always stored even if drafting takes a long time
-        drafted_response = None
-        if auto_draft and org_id:
-            logger.info(f"🤖 Will auto-draft response for email {email_data.gmail_message_id} with org_id {org_id} (async)")
-            # Start async draft task (fire and forget) - runs in background
-            # Email will be stored immediately, draft will be added when ready
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(_draft_and_update_email_async(email_id, email_data, org_id))
-                else:
+            
+            # Store email first, then draft response asynchronously (non-blocking)
+            # This ensures emails are always stored even if drafting takes a long time
+            drafted_response = None
+            if auto_draft and org_id:
+                logger.info(f"🤖 Will auto-draft response for email {email_data.gmail_message_id} with org_id {org_id} (async)")
+                # Start async draft task (fire and forget) - runs in background
+                # Email will be stored immediately, draft will be added when ready
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        loop.create_task(_draft_and_update_email_async(email_id, email_data, org_id))
+                    else:
+                        asyncio.ensure_future(_draft_and_update_email_async(email_id, email_data, org_id))
+                except RuntimeError:
+                    # If no event loop, create a new one
                     asyncio.ensure_future(_draft_and_update_email_async(email_id, email_data, org_id))
-            except RuntimeError:
-                # If no event loop, create a new one
-                asyncio.ensure_future(_draft_and_update_email_async(email_id, email_data, org_id))
-        else:
-            logger.info(f"ℹ️  Skipping auto-draft (auto_draft={auto_draft}, org_id={org_id})")
-        
+            else:
+                logger.info(f"ℹ️  Skipping auto-draft (auto_draft={auto_draft}, org_id={org_id})")
+            
             # Create full raw email content as a structured string
             # Store complete email content for both retrieval and semantic search
             # Format: All email fields including full body (both HTML and plain)
@@ -336,11 +402,22 @@ async def store_email(email_data: EmailCreate, organization_id: Optional[int] = 
                     return None
                     
         except Exception as e:
-            logger.error(f"❌ Error storing email: {e}", exc_info=True)
+            # Log error with full context (no silent failures per BACKEND_REVIEW.md)
+            logger.error(
+                f"❌ Error storing email {email_data.gmail_message_id}: {type(e).__name__}: {str(e)}",
+                exc_info=True,
+                extra={
+                    "gmail_message_id": email_data.gmail_message_id,
+                    "user_id": email_data.user_id,
+                    "organization_id": organization_id,
+                    "exception_type": type(e).__name__
+                }
+            )
+            # Return None to indicate failure (caller should handle)
             return None
         finally:
-            # Clean up lock after a delay to prevent memory leak (locks are per-email-id)
-            # Note: We keep locks in memory but they're lightweight. In production, consider using Redis for distributed locks
+            # Note: Lock cleanup happens automatically when we reach MAX_LOCKS
+            # This prevents memory leaks while maintaining thread safety
             pass
 
 

@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings
-from pydantic import ConfigDict
+from pydantic import ConfigDict, Field, AliasChoices
 from typing import Optional
 from pathlib import Path
 from dotenv import load_dotenv
@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # Service Configuration
     SERVICE_NAME: str = "rate_sheet_service"
     PORT: int = 8010
-    DEBUG: bool = False
+    DEBUG: bool = Field(default=False, validation_alias=AliasChoices("DEBUG", "debug"))
     
     # PostgreSQL Database Configuration (for structured rate sheet data)
     DB_HOST: str = "localhost"

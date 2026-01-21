@@ -23,15 +23,17 @@ from ..models import User
 from ..utils.oauth import exchange_code_for_token
 from ..utils.jwt import generate_jwt_token
 import secrets
+import logging
 
+logger = logging.getLogger(__name__)
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 class AuthService:
     """
-    Authentication service stub.
-    Replace TODOs with real DB and token logic.
+    Authentication service for user authentication and Gmail integration.
+    Handles login, signup, Google OAuth, and Gmail webhook notifications.
     """
 
     async def login(self, payload: LoginRequest) -> AuthResponse:
@@ -76,11 +78,13 @@ class AuthService:
                                     headers={"Authorization": f"Bearer {token}"},
                                     timeout=5.0
                                 )
-                        except:
-                            pass  # Don't block login if email service is unavailable
+                        except Exception as e:
+                            # Log but don't block login if email service is unavailable
+                            logger.warning(f"Failed to trigger email fetch on login: {e}", exc_info=True)
                     asyncio.create_task(trigger_email_fetch())
-                except:
-                    pass  # Silent fail - don't block login
+                except Exception as e:
+                    # Log but don't block login - email fetch is non-critical
+                    logger.warning(f"Failed to schedule email fetch on login: {e}", exc_info=True)
             name = None
             if user.first_name or user.last_name:
                 name = f"{user.first_name or ''} {user.last_name or ''}".strip()
@@ -297,11 +301,13 @@ class AuthService:
                                         headers={"Authorization": f"Bearer {token}"},
                                         timeout=5.0
                                     )
-                            except:
-                                pass  # Don't block login if email service is unavailable
+                            except Exception as e:
+                                # Log but don't block login if email service is unavailable
+                                logger.warning(f"Failed to trigger email fetch on login: {e}", exc_info=True)
                         asyncio.create_task(trigger_email_fetch())
-                    except:
-                        pass  # Silent fail - don't block login
+                    except Exception as e:
+                        # Log but don't block login - email fetch is non-critical
+                        logger.warning(f"Failed to schedule email fetch on login: {e}", exc_info=True)
                 
                 # Clear state cookie
                 response = RedirectResponse(
@@ -1054,11 +1060,28 @@ class AuthService:
                         gmail_data = response.json()
                         messages_to_process = gmail_data.get('messages', [])
                     except (httpx.TimeoutException, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
-                        logger.warning(f"⚠️  Timeout fetching Gmail list: {type(e).__name__}. Will retry on next webhook.")
+                        # Log timeout with context (no silent failure per BACKEND_REVIEW.md)
+                        logger.warning(
+                            f"⚠️  Timeout fetching Gmail list: {type(e).__name__}. Will retry on next webhook.",
+                            extra={
+                                "email_address": email_address,
+                                "history_id": history_id,
+                                "exception_type": type(e).__name__
+                            }
+                        )
                         return  # Return gracefully, will retry on next notification
                     except Exception as e:
-                        logger.error(f"❌ Error fetching Gmail list: {e}", exc_info=True)
-                        return  # Return gracefully
+                        # Log error with full context (no silent failure)
+                        logger.error(
+                            f"❌ Error fetching Gmail list: {type(e).__name__}: {str(e)}",
+                            exc_info=True,
+                            extra={
+                                "email_address": email_address,
+                                "history_id": history_id,
+                                "exception_type": type(e).__name__
+                            }
+                        )
+                        return  # Return gracefully (webhook should acknowledge receipt)
                 
                 logger.info(f"✅ Processing {len(messages_to_process)} messages")
                 
@@ -1143,23 +1166,62 @@ class AuthService:
                                     error_text = store_response.text[:500] if hasattr(store_response, 'text') else "No error text"
                                     logger.error(f"❌ Failed to store email {msg_id}: HTTP {store_response.status_code} - {error_text}")
                             except httpx.TimeoutException:
-                                logger.warning(f"⚠️  Timeout storing email {msg_id} - email may still be stored (drafting is async). Continuing...")
+                                # Log timeout with context (no silent failure)
+                                logger.warning(
+                                    f"⚠️  Timeout storing email {msg_id} - email may still be stored (drafting is async). Continuing...",
+                                    extra={
+                                        "msg_id": msg_id,
+                                        "user_id": user_id,
+                                        "exception_type": "TimeoutException"
+                                    }
+                                )
                                 # Don't fail the whole webhook if one email times out
                                 # Email service should have stored it even if response timed out
                             except httpx.ReadTimeout:
-                                logger.warning(f"⚠️  Read timeout storing email {msg_id} - email may still be stored (drafting is async). Continuing...")
+                                # Log timeout with context (no silent failure)
+                                logger.warning(
+                                    f"⚠️  Read timeout storing email {msg_id} - email may still be stored (drafting is async). Continuing...",
+                                    extra={
+                                        "msg_id": msg_id,
+                                        "user_id": user_id,
+                                        "exception_type": "ReadTimeout"
+                                    }
+                                )
                                 # Don't fail the whole webhook if one email times out
                         else:
                             error_text = detail_response.text[:500] if hasattr(detail_response, 'text') else "No error text"
                             logger.error(f"❌ Failed to get email detail {msg_id}: HTTP {detail_response.status_code} - {error_text}")
                             
                     except Exception as e:
-                        logger.error(f"❌ Error processing email {msg.get('id', 'unknown')}: {e}", exc_info=True)
+                        # Log error with full context (no silent failure per BACKEND_REVIEW.md)
+                        msg_id = msg.get('id', 'unknown')
+                        logger.error(
+                            f"❌ Error processing email {msg_id}: {type(e).__name__}: {str(e)}",
+                            exc_info=True,
+                            extra={
+                                "msg_id": msg_id,
+                                "user_id": user_id,
+                                "email_address": email_address,
+                                "exception_type": type(e).__name__
+                            }
+                        )
+                        # Continue processing other emails (don't fail entire webhook)
                 
                 logger.info(f"✅ Gmail notification processed: {processed_count}/{len(messages_to_process)} emails stored")
                     
         except Exception as e:
-            logger.error(f"Error handling Gmail notification: {e}", exc_info=True)
+            # Log top-level error with full context (no silent failure)
+            logger.error(
+                f"Error handling Gmail notification: {type(e).__name__}: {str(e)}",
+                exc_info=True,
+                extra={
+                    "email_address": email_address,
+                    "history_id": history_id,
+                    "exception_type": type(e).__name__
+                }
+            )
+            # Re-raise to let webhook handler decide (may want to return error to Pub/Sub)
+            raise
 
 
 auth_service = AuthService()

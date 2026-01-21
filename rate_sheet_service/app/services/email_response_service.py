@@ -703,12 +703,21 @@ Return a JSON object with:
                 raise Exception(f"AI service returned {response.status_code}")
         
         except Exception as e:
-            logger.error(f"Error calling AI service: {e}")
-            # Fallback email
+            # Log error with full context (no silent failures per BACKEND_REVIEW.md)
+            logger.error(
+                f"Error calling AI service for email draft: {type(e).__name__}: {str(e)}",
+                exc_info=True,
+                extra={
+                    "email_query": email_query[:200],  # Truncate for logging
+                    "original_subject": original_subject,
+                    "exception_type": type(e).__name__
+                }
+            )
+            # Return fallback email (graceful degradation, but error is logged)
             return {
                 "subject": f"Re: {original_subject or 'Rate Sheet Inquiry'}",
                 "body": f"Thank you for your inquiry.\n\n{email_query}\n\nI found relevant rate sheet information. Please let me know if you need more details.",
-                "confidence_note": f"Confidence: {confidence_score:.1%}"
+                "confidence_note": f"Confidence: {confidence_score:.1%} (AI service unavailable)"
             }
     
     def _create_no_results_email(self, query: str) -> Dict[str, Any]:

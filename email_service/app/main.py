@@ -1,5 +1,7 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
+import sys
+from pathlib import Path
 from .api.routes import router as email_router
 from .services.email_service import ensure_collection_exists
 import logging
@@ -10,6 +12,18 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Try to import shared error handlers
+SHARED_PATH = Path(__file__).parent.parent.parent.parent.parent / "shared"
+if str(SHARED_PATH) not in sys.path:
+    sys.path.insert(0, str(SHARED_PATH))
+
+try:
+    from error_handlers import register_error_handlers
+    ERROR_HANDLERS_AVAILABLE = True
+except ImportError:
+    ERROR_HANDLERS_AVAILABLE = False
+    logger.warning("Shared error handlers not available, using default FastAPI error handling")
 
 
 @asynccontextmanager
@@ -47,6 +61,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Register error handlers if available
+if ERROR_HANDLERS_AVAILABLE:
+    register_error_handlers(app)
+
 app.include_router(email_router)
 
 
@@ -75,8 +93,9 @@ async def status_check():
             if response.status_code == 200:
                 vector_db_ok = True
                 email_count = response.json().get('count', 0)
-    except:
-        pass
+    except Exception as e:
+        # Log but don't fail status check - health checks should be resilient
+        logger.debug(f"Vector DB health check failed: {e}")
     
     # Check auth service
     auth_service_ok = False
@@ -84,8 +103,9 @@ async def status_check():
         async with httpx.AsyncClient() as client:
             response = await client.get("http://localhost:8001/health", timeout=5.0)
             auth_service_ok = response.status_code == 200
-    except:
-        pass
+    except Exception as e:
+        # Log but don't fail status check - health checks should be resilient
+        logger.debug(f"Auth service health check failed: {e}")
     
     # Get monitored users count
     users = await get_gmail_connected_users() if auth_service_ok else []
