@@ -3,9 +3,10 @@ from sqlalchemy.orm import declarative_base
 from app.core.config import settings
 
 # Create async engine
+# Set echo=False to suppress SQLAlchemy query logs (they're too verbose)
 engine = create_async_engine(
     settings.DATABASE_URL,
-    echo=settings.debug,
+    echo=False,  # Disable SQL query logging for cleaner logs
     future=True,
 )
 

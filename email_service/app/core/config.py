@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     # Auth service URL (to get user info and Gmail tokens)
     AUTH_SERVICE_URL: str = "http://localhost:8001"
     
+    # Rate Sheet Service URL (for drafting email responses)
+    RATE_SHEET_SERVICE_URL: str = "http://localhost:8010"
+    
     # Frontend URL
     FRONTEND_URL: str = "http://localhost:3000"
     

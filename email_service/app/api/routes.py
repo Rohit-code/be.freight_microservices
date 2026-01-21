@@ -1,9 +1,11 @@
 from fastapi import APIRouter, HTTPException, Header, Query, Request
 from typing import Optional, List, Dict, Any
+from fastapi import Query
 from ..services.email_service import (
     store_email,
     get_new_emails,
     get_user_emails,
+    get_user_drafts,
     mark_email_as_read,
     mark_email_as_processed,
     search_emails_semantic,
@@ -19,34 +21,82 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/email", tags=["email"])
 
+"""
+IMPORTANT: User-Level Email Privacy (Different from Rate Sheets)
+
+Email Model:
+- Emails are USER-SPECIFIC and PRIVATE to each individual user
+- Unlike rate sheets (which are organization-wide), emails are NOT shared within organizations
+- Each user can ONLY see and manage their own emails
+- When an email is received, it's associated with the specific user who received it
+- Users within the same organization CANNOT see each other's emails
+
+This ensures complete privacy between users, even within the same organization.
+"""
+
 
 async def get_user_from_token(token: str) -> Dict[str, Any]:
     """Get user data from auth service"""
     import httpx
-    async with httpx.AsyncClient() as client:
-        auth_response = await client.get(
-            f"{settings.AUTH_SERVICE_URL}/api/auth/me",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10.0
-        )
-        
-        if auth_response.status_code != 200:
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid authentication token",
+    try:
+        async with httpx.AsyncClient() as client:
+            auth_response = await client.get(
+                f"{settings.AUTH_SERVICE_URL}/api/auth/me",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30.0  # Increased timeout for auth service calls
             )
-        
-        return auth_response.json()
+            
+            if auth_response.status_code != 200:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid authentication token",
+                )
+            
+            return auth_response.json()
+    except (httpx.TimeoutException, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+        logger.error(f"Timeout getting user from token - auth service unavailable: {type(e).__name__}")
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication service unavailable: Request timeout"
+        )
+    except httpx.RequestError as e:
+        logger.error(f"Error connecting to auth service: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Authentication service unavailable: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error getting user from token: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Authentication service error: {str(e)}"
+        )
 
 
 @router.post("/store")
 async def store_email_endpoint(request: Request):
-    """Store an email in vector DB"""
+    """
+    Store an email in vector DB and automatically draft a response
+    
+    Body can include:
+    - organization_id: Optional, if provided will auto-draft response
+    - auto_draft: Optional, defaults to True if organization_id is provided
+    """
+    logger.info("=" * 80)
+    logger.info("📥 EMAIL STORE ENDPOINT CALLED")
+    
     try:
         body_data = await request.json()
+        logger.info(f"Request body keys: {list(body_data.keys())}")
+        logger.info(f"user_id: {body_data.get('user_id')}")
+        logger.info(f"gmail_message_id: {body_data.get('gmail_message_id')}")
+        logger.info(f"subject: {body_data.get('subject', 'No Subject')}")
+        logger.info(f"organization_id: {body_data.get('organization_id')}")
+        logger.info(f"auto_draft: {body_data.get('auto_draft', True)}")
         
         # Validate required fields
         if not body_data.get('user_id') or not body_data.get('gmail_message_id'):
+            logger.error("❌ Missing required fields: user_id or gmail_message_id")
             raise HTTPException(
                 status_code=400,
                 detail="Missing required fields: user_id, gmail_message_id",
@@ -70,23 +120,45 @@ async def store_email_endpoint(request: Request):
             is_sent=body_data.get('is_sent', False),
         )
         
-        email = await store_email(email_data)
+        # Get organization_id and auto_draft flag
+        organization_id = body_data.get('organization_id')
+        auto_draft = body_data.get('auto_draft', True)  # Default to True if org_id provided
+        
+        # Store email with auto-draft enabled
+        logger.info(f"📦 Calling store_email (org_id: {organization_id}, auto_draft: {auto_draft})")
+        email = await store_email(email_data, organization_id=organization_id, auto_draft=auto_draft)
         
         if not email:
+            logger.error("❌ store_email returned None")
             raise HTTPException(
                 status_code=500,
                 detail="Failed to store email in vector DB",
             )
         
-        return {
+        logger.info(f"✅ Email stored successfully: {email.id}")
+        
+        response_data = {
             "id": email.id,
             "gmail_message_id": email.gmail_message_id,
             "message": "Email stored successfully in vector DB"
         }
         
+        # Include drafted response if available
+        if email.drafted_response:
+            logger.info("✅ Drafted response included in email")
+            response_data["drafted_response"] = email.drafted_response
+            response_data["has_draft"] = True
+        else:
+            logger.info("ℹ️  No drafted response (may be skipped if org_id missing)")
+        
+        logger.info("=" * 80)
+        return response_data
+        
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"❌ Error storing email: {e}", exc_info=True)
+        logger.info("=" * 80)
         raise HTTPException(
             status_code=500,
             detail=f"Failed to store email: {str(e)}",
@@ -148,8 +220,146 @@ async def get_new_emails_endpoint(
 async def list_emails_endpoint(
     authorization: str = Header(default=""),
     limit: int = Query(default=100, ge=1, le=500),
+    organization_id: Optional[int] = Query(None),
+    include_drafts: bool = Query(default=False),
 ):
-    """List all emails for the current user"""
+    """
+    List all emails for the current user
+    If include_drafts=True, automatically drafts responses for pending emails
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=403,
+            detail="Authorization header missing or invalid",
+        )
+    
+    token = authorization.replace("Bearer ", "")
+    
+    try:
+        auth_data = await get_user_from_token(token)
+        user_id = int(auth_data['user']['id'])
+        org_id = organization_id or auth_data['user'].get('organization_id')
+        
+        try:
+            emails = await get_user_emails(user_id, limit=limit)
+        except Exception as e:
+            logger.error(f"Error getting user emails for user {user_id}: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to retrieve emails"
+            )
+        
+        # Build email list with optional drafted responses
+        email_list = []
+        for email in emails:
+            email_data = {
+                "id": email.id,
+                "gmail_message_id": email.gmail_message_id,
+                "subject": email.subject,
+                "from_email": email.from_email,
+                "to_email": email.to_email,
+                "snippet": email.snippet,
+                "body_plain": email.body_plain,
+                "body_html": email.body_html,
+                "date": email.date,
+                "has_attachments": email.has_attachments,
+                "attachment_count": email.attachment_count,
+                "is_read": email.is_read,
+                "is_processed": email.is_processed,
+                "is_rate_sheet": email.is_rate_sheet,
+            }
+            
+            # Check if email already has a drafted response (from auto-draft on storage)
+            if email.drafted_response:
+                email_data["drafted_response"] = email.drafted_response
+                logger.debug(f"Email {email.id} already has auto-drafted response")
+            
+            # If include_drafts and email is pending and no draft exists, draft a response
+            elif include_drafts and not email.is_processed and org_id:
+                logger.info(f"Drafting response for email {email.id} (gmail_id: {email.gmail_message_id}), org_id: {org_id}, is_processed: {email.is_processed}")
+                try:
+                    import httpx
+                    # Use email content as query to draft response
+                    email_query = email.body_plain or email.snippet or email.subject or ""
+                    logger.info(f"Email query extracted: {email_query[:200]}... (length: {len(email_query)})")
+                    
+                    if email_query:
+                        draft_url = f"{settings.RATE_SHEET_SERVICE_URL}/api/rate-sheets/draft-email-response?organization_id={org_id}"
+                        logger.info(f"Calling draft endpoint: {draft_url}")
+                        
+                        async with httpx.AsyncClient(timeout=30.0) as client:
+                            draft_response = await client.post(
+                                draft_url,
+                                json={
+                                    "email_query": email_query,
+                                    "original_email_subject": email.subject,
+                                    "original_email_from": email.from_email,
+                                    "limit": 5
+                                },
+                                headers={"Content-Type": "application/json"},
+                                timeout=30.0
+                            )
+                            
+                            logger.info(f"Draft response status: {draft_response.status_code} for email {email.id}")
+                            
+                            if draft_response.status_code == 200:
+                                draft_data = draft_response.json()
+                                email_data["drafted_response"] = draft_data
+                                logger.info(f"Successfully drafted response for email {email.id}")
+                            else:
+                                error_text = draft_response.text[:500] if hasattr(draft_response, 'text') else "No error text"
+                                logger.error(f"Draft endpoint returned {draft_response.status_code}: {error_text}")
+                                email_data["draft_error"] = f"HTTP {draft_response.status_code}: {error_text}"
+                    else:
+                        logger.warning(f"No email query content found for email {email.id}")
+                        email_data["draft_error"] = "No email content available for query"
+                except Exception as e:
+                    logger.error(f"Failed to draft response for email {email.id}: {e}", exc_info=True)
+                    email_data["draft_error"] = str(e)
+            elif include_drafts:
+                # Log why draft was skipped
+                if email.is_processed:
+                    logger.debug(f"Skipping draft for email {email.id} - already processed")
+                elif not org_id:
+                    logger.warning(f"Skipping draft for email {email.id} - no organization_id (org_id: {org_id})")
+            
+            email_list.append(email_data)
+        
+        return {
+            "emails": email_list,
+            "total": len(email_list)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to list emails: {str(e)}",
+        )
+
+
+@router.get("/drafts")
+async def list_drafts_endpoint(
+    authorization: str = Header(default=""),
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(default=10, ge=1, le=100, description="Number of drafts per page")
+):
+    """
+    List all drafted email responses for the current user with pagination.
+    
+    IMPORTANT: User-Level Privacy
+    - Returns ONLY drafts for the authenticated user (user-specific)
+    - Users can ONLY see their own drafts
+    - Drafts are filtered by user_id from the auth token
+    
+    Returns emails that have auto-drafted responses, including:
+    - Email details (subject, from, to, body, etc.)
+    - Drafted response (subject, body, confidence scores)
+    - Rate sheets used for drafting
+    
+    Pagination: 10 drafts per page by default
+    """
     if not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=403,
@@ -162,35 +372,69 @@ async def list_emails_endpoint(
         auth_data = await get_user_from_token(token)
         user_id = int(auth_data['user']['id'])
         
-        emails = await get_user_emails(user_id, limit=limit)
+        logger.info(f"📋 Listing drafts for user {user_id} (page: {page}, page_size: {page_size})")
         
-        return {
-            "emails": [
-                {
+        # Calculate offset
+        offset = (page - 1) * page_size
+        
+        # Get drafts with pagination (user-specific filtering)
+        drafts, total_count = await get_user_drafts(user_id, limit=page_size, offset=offset)
+        
+        logger.info(f"✅ Returning {len(drafts)} drafts for user {user_id} (total: {total_count})")
+        
+        # Build response with all draft data
+        drafts_list = []
+        for email in drafts:
+            draft_data = {
+                # Email information
+                "email": {
                     "id": email.id,
                     "gmail_message_id": email.gmail_message_id,
+                    "gmail_thread_id": email.gmail_thread_id,
                     "subject": email.subject,
-                    "from": email.from_email,
-                    "to": email.to_email,
+                    "from_email": email.from_email,
+                    "to_email": email.to_email,
+                    "cc_email": email.cc_email,
+                    "bcc_email": email.bcc_email,
                     "snippet": email.snippet,
+                    "body_plain": email.body_plain,
+                    "body_html": email.body_html,
                     "date": email.date,
                     "has_attachments": email.has_attachments,
                     "attachment_count": email.attachment_count,
                     "is_read": email.is_read,
                     "is_processed": email.is_processed,
                     "is_rate_sheet": email.is_rate_sheet,
-                }
-                for email in emails
-            ],
-            "total": len(emails)
+                    "created_at": email.created_at,
+                    "updated_at": email.updated_at,
+                },
+                # Drafted response (complete data)
+                "draft": email.drafted_response if email.drafted_response else None,
+            }
+            drafts_list.append(draft_data)
+        
+        # Calculate pagination info
+        total_pages = (total_count + page_size - 1) // page_size if total_count > 0 else 0
+        
+        return {
+            "drafts": drafts_list,
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+                "total_count": total_count,
+                "total_pages": total_pages,
+                "has_next": page < total_pages,
+                "has_previous": page > 1
+            }
         }
         
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Failed to list drafts: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to list emails: {str(e)}",
+            detail=f"Failed to list drafts: {str(e)}",
         )
 
 
@@ -254,7 +498,11 @@ async def mark_email_read(
     email_id: str,
     authorization: str = Header(default="")
 ):
-    """Mark an email as read"""
+    """
+    Mark an email as read
+    
+    IMPORTANT: Emails are user-private. Users can only mark their own emails as read.
+    """
     if not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=403,
@@ -262,13 +510,18 @@ async def mark_email_read(
         )
     
     try:
-        success = await mark_email_as_read(email_id)
+        token = authorization.replace("Bearer ", "")
+        auth_data = await get_user_from_token(token)
+        user_id = int(auth_data['user']['id'])
+        
+        # Verify user ownership before marking as read
+        success = await mark_email_as_read(email_id, user_id=user_id)
         if success:
             return {"message": "Email marked as read", "email_id": email_id}
         else:
             raise HTTPException(
                 status_code=404,
-                detail="Email not found or update failed",
+                detail="Email not found or you don't have permission to access it",
             )
         
     except HTTPException:
@@ -285,7 +538,11 @@ async def mark_email_processed(
     email_id: str,
     authorization: str = Header(default="")
 ):
-    """Mark an email as processed"""
+    """
+    Mark an email as processed
+    
+    IMPORTANT: Emails are user-private. Users can only mark their own emails as processed.
+    """
     if not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=403,
@@ -293,13 +550,18 @@ async def mark_email_processed(
         )
     
     try:
-        success = await mark_email_as_processed(email_id)
+        token = authorization.replace("Bearer ", "")
+        auth_data = await get_user_from_token(token)
+        user_id = int(auth_data['user']['id'])
+        
+        # Verify user ownership before marking as processed
+        success = await mark_email_as_processed(email_id, user_id=user_id)
         if success:
             return {"message": "Email marked as processed", "email_id": email_id}
         else:
             raise HTTPException(
                 status_code=404,
-                detail="Email not found or update failed",
+                detail="Email not found or you don't have permission to access it",
             )
         
     except HTTPException:

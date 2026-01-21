@@ -46,6 +46,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8006 --reload &
 USER_PID=$!
 cd ..
 
+# Start Rate Sheet Service
+echo "Starting Rate Sheet Service on port 8010..."
+cd rate_sheet_service
+uvicorn app.main:app --host 0.0.0.0 --port 8010 --reload &
+RATE_SHEET_PID=$!
+cd ..
+
 # Wait a bit for services to start
 sleep 2
 
@@ -65,9 +72,10 @@ echo "AI Service: http://localhost:8003"
 echo "Vector DB Service: http://localhost:8004"
 echo "Email Service: http://localhost:8005"
 echo "User Service: http://localhost:8006"
+echo "Rate Sheet Service: http://localhost:8010"
 echo ""
 echo "Press Ctrl+C to stop all services"
 
 # Wait for user interrupt
-trap "kill $AUTH_PID $CONSTANTS_PID $AI_PID $VECTOR_PID $EMAIL_PID $USER_PID $GATEWAY_PID; exit" INT TERM
+trap "kill $AUTH_PID $CONSTANTS_PID $AI_PID $VECTOR_PID $EMAIL_PID $USER_PID $RATE_SHEET_PID $GATEWAY_PID; exit" INT TERM
 wait

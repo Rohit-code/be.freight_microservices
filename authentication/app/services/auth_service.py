@@ -942,6 +942,9 @@ class AuthService:
         
         logger = logging.getLogger(__name__)
         
+        # Import settings at function level to avoid circular imports
+        from ..core.config import settings as auth_settings
+        
         try:
             # Find user by email
             async with AsyncSessionLocal() as session:
@@ -960,64 +963,203 @@ class AuthService:
                 
                 user_id = user.id
             
-            logger.info(f"Processing Gmail notification for user {user_id} ({email_address})")
+            logger.info(f"📧 Processing Gmail notification for user {user_id} ({email_address})")
+            
+            # Get user's organization_id (for auto-drafting email responses)
+            organization_id = None
+            try:
+                # Get organization_id from user service (internal endpoint)
+                async with httpx.AsyncClient() as org_client:
+                    org_url = f"{auth_settings.USER_SERVICE_URL}/api/user/internal/user/{user_id}/organization-id"
+                    logger.info(f"🔍 Getting organization_id from user service: {org_url}")
+                    org_response = await org_client.get(org_url, timeout=10.0)
+                    
+                    if org_response.status_code == 200:
+                        org_data = org_response.json()
+                        organization_id = org_data.get('organization_id')
+                        if organization_id:
+                            logger.info(f"✅ Got organization_id: {organization_id} for user {user_id}")
+                        else:
+                            logger.warning(f"⚠️  User {user_id} has no organization (message: {org_data.get('message')})")
+                    else:
+                        logger.warning(f"⚠️  Failed to get organization_id: HTTP {org_response.status_code}")
+            except Exception as e:
+                logger.warning(f"⚠️  Could not get organization_id for user {user_id}: {e}")
+                # Continue without organization_id - email will still be stored, just no auto-draft
+            
+            logger.info(f"🔍 Fetching NEW emails since historyId {history_id} for user {user_id}")
+            
+            # Use Gmail history API to get only NEW emails since the historyId
+            from ..services.gmail_service import get_history_since
+            from ..models import User as UserModel
+            
+            # Get user object for history API
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(UserModel).where(UserModel.id == user_id)
+                )
+                user_obj = result.scalar_one_or_none()
+            
+            if not user_obj:
+                logger.error(f"User {user_id} not found")
+                return
+            
+            # Get new emails since historyId
+            # Note: The historyId in webhook is the NEW historyId after email was added
+            # We need to get messages added since the PREVIOUS historyId
+            # For now, we'll use the list API to get recent messages and filter duplicates
+            new_message_ids = []
+            try:
+                # Try to get history, but if it fails or returns empty, fall back to list API
+                # Get more messages from history (increased from 50 to 100)
+                history_result = await get_history_since(user_obj, history_id, max_results=100)
+                new_message_ids = history_result.get('newMessageIds', [])
+                logger.info(f"✅ Found {len(new_message_ids)} new messages since historyId {history_id}")
+                
+                # If history API returns empty, it might mean historyId is too new or expired
+                # Fall through to list API to get recent messages anyway
+                if not new_message_ids:
+                    logger.info("History API returned no new messages, will use list API to get recent messages")
+                
+            except Exception as e:
+                logger.warning(f"Could not get history (may be expired), falling back to list API: {e}")
+                new_message_ids = []
             
             # Trigger email fetch via email service internal API
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    f"http://localhost:8001/api/auth/internal/gmail/{user_id}/list",
-                    params={"max_results": 10},
-                    timeout=30.0
-                )
+            # Use longer timeout for Gmail API calls which can be slow
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                # If we have specific message IDs from history, use those
+                # Otherwise, fall back to listing recent messages
+                if new_message_ids:
+                    # Process all new messages from history (up to 50)
+                    messages_to_process = [{"id": msg_id} for msg_id in new_message_ids[:50]]
+                    logger.info(f"📬 Processing {len(messages_to_process)} new messages from history")
+                else:
+                    # Fallback: get recent messages (increase limit to check more emails)
+                    gmail_list_url = f"http://localhost:8001/api/auth/internal/gmail/{user_id}/list"
+                    logger.info(f"GET {gmail_list_url}?max_results=50")
+                    try:
+                        response = await client.get(
+                            gmail_list_url,
+                            params={"max_results": 50},  # Increased from 10 to 50
+                            timeout=60.0  # Increased timeout for Gmail API calls
+                        )
+                        
+                        logger.info(f"Gmail list response status: {response.status_code}")
+                        
+                        if response.status_code != 200:
+                            logger.error(f"Failed to fetch emails: {response.status_code}")
+                            return
+                        
+                        gmail_data = response.json()
+                        messages_to_process = gmail_data.get('messages', [])
+                    except (httpx.TimeoutException, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+                        logger.warning(f"⚠️  Timeout fetching Gmail list: {type(e).__name__}. Will retry on next webhook.")
+                        return  # Return gracefully, will retry on next notification
+                    except Exception as e:
+                        logger.error(f"❌ Error fetching Gmail list: {e}", exc_info=True)
+                        return  # Return gracefully
                 
-                if response.status_code == 200:
-                    gmail_data = response.json()
-                    messages = gmail_data.get('messages', [])
-                    
-                    # Store new emails via email service
-                    for msg in messages[:5]:  # Process up to 5 most recent
+                logger.info(f"✅ Processing {len(messages_to_process)} messages")
+                
+                if not messages_to_process:
+                    logger.warning("⚠️  No messages to process")
+                    return
+                
+                # Store new emails via email service (with auto-draft enabled)
+                processed_count = 0
+                # Process all messages (up to 50) - increased from 10 to check more emails
+                for msg in messages_to_process[:50]:
+                    try:
+                        msg_id = msg.get('id')
+                        logger.info(f"📨 Processing message {msg_id}")
+                        
+                        # Get full email detail
+                        detail_url = f"http://localhost:8001/api/auth/internal/gmail/{user_id}/detail/{msg_id}"
+                        logger.info(f"GET {detail_url}")
+                        detail_response = None
                         try:
-                            # Get full email detail
                             detail_response = await client.get(
-                                f"http://localhost:8001/api/auth/internal/gmail/{user_id}/detail/{msg['id']}",
-                                timeout=30.0
+                                detail_url,
+                                timeout=60.0  # Increased timeout for Gmail API calls
                             )
                             
-                            if detail_response.status_code == 200:
-                                email_detail = detail_response.json()
-                                
-                                # Store in email service
+                            logger.info(f"Email detail response status: {detail_response.status_code}")
+                        except (httpx.TimeoutException, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+                            logger.warning(f"⚠️  Timeout getting email detail for {msg_id}: {type(e).__name__}. Skipping this email and continuing...")
+                            continue  # Skip this email and process the next one
+                        except Exception as e:
+                            logger.error(f"❌ Error getting email detail for {msg_id}: {e}. Skipping...")
+                            continue  # Skip this email and process the next one
+                        
+                        if not detail_response:
+                            logger.warning(f"⚠️  No detail response for {msg_id}, skipping...")
+                            continue
+                            
+                        if detail_response.status_code == 200:
+                            email_detail = detail_response.json()
+                            subject = email_detail.get('subject', 'No Subject')
+                            from_email = email_detail.get('from', 'Unknown')
+                            logger.info(f"📧 Email: '{subject}' from {from_email}")
+                            
+                            # Store in email service with auto-draft enabled
+                            store_url = "http://localhost:8005/api/email/store"
+                            store_payload = {
+                                "user_id": user_id,
+                                "gmail_message_id": msg_id,
+                                "gmail_thread_id": msg.get('threadId'),
+                                "subject": email_detail.get('subject'),
+                                "from_email": email_detail.get('from'),
+                                "to_email": email_detail.get('to'),
+                                "snippet": email_detail.get('snippet'),
+                                "body_plain": email_detail.get('body') if '<' not in email_detail.get('body', '') else None,
+                                "body_html": email_detail.get('body') if '<' in email_detail.get('body', '') else None,
+                                "date": email_detail.get('date'),
+                                "has_attachments": email_detail.get('attachmentCount', 0) > 0,
+                                "attachment_count": email_detail.get('attachmentCount', 0),
+                                "organization_id": organization_id,  # Pass org_id for auto-draft
+                                "auto_draft": True,  # Enable auto-drafting
+                            }
+                            
+                            logger.info(f"POST {store_url} (org_id: {organization_id}, auto_draft: True)")
+                            # Email storage is now fast (drafting is async), but keep longer timeout for safety
+                            try:
                                 store_response = await client.post(
-                                    "http://localhost:8005/api/email/store",
-                                    json={
-                                        "user_id": user_id,
-                                        "gmail_message_id": msg['id'],
-                                        "gmail_thread_id": msg.get('threadId'),
-                                        "subject": email_detail.get('subject'),
-                                        "from_email": email_detail.get('from'),
-                                        "to_email": email_detail.get('to'),
-                                        "snippet": email_detail.get('snippet'),
-                                        "body_plain": email_detail.get('body') if '<' not in email_detail.get('body', '') else None,
-                                        "body_html": email_detail.get('body') if '<' in email_detail.get('body', '') else None,
-                                        "date": email_detail.get('date'),
-                                        "has_attachments": email_detail.get('attachmentCount', 0) > 0,
-                                        "attachment_count": email_detail.get('attachmentCount', 0),
-                                    },
-                                    timeout=60.0
+                                    store_url,
+                                    json=store_payload,
+                                    timeout=120.0  # 2 minutes - email stores quickly, but keep buffer
                                 )
                                 
+                                logger.info(f"Store response status: {store_response.status_code}")
+                                
                                 if store_response.status_code == 200:
-                                    logger.info(f"Stored email {msg['id']} for user {user_id}")
-                                    
-                        except Exception as e:
-                            logger.error(f"Error storing email {msg.get('id')}: {e}")
-                    
-                    logger.info(f"Gmail notification processed: {len(messages)} messages checked")
-                else:
-                    logger.error(f"Failed to fetch emails: {response.status_code}")
+                                    store_data = store_response.json()
+                                    if store_data.get('has_draft'):
+                                        logger.info(f"✅ Stored email {msg_id} for user {user_id} with auto-drafted response")
+                                    else:
+                                        logger.info(f"✅ Stored email {msg_id} for user {user_id}")
+                                    processed_count += 1
+                                else:
+                                    error_text = store_response.text[:500] if hasattr(store_response, 'text') else "No error text"
+                                    logger.error(f"❌ Failed to store email {msg_id}: HTTP {store_response.status_code} - {error_text}")
+                            except httpx.TimeoutException:
+                                logger.warning(f"⚠️  Timeout storing email {msg_id} - email may still be stored (drafting is async). Continuing...")
+                                # Don't fail the whole webhook if one email times out
+                                # Email service should have stored it even if response timed out
+                            except httpx.ReadTimeout:
+                                logger.warning(f"⚠️  Read timeout storing email {msg_id} - email may still be stored (drafting is async). Continuing...")
+                                # Don't fail the whole webhook if one email times out
+                        else:
+                            error_text = detail_response.text[:500] if hasattr(detail_response, 'text') else "No error text"
+                            logger.error(f"❌ Failed to get email detail {msg_id}: HTTP {detail_response.status_code} - {error_text}")
+                            
+                    except Exception as e:
+                        logger.error(f"❌ Error processing email {msg.get('id', 'unknown')}: {e}", exc_info=True)
+                
+                logger.info(f"✅ Gmail notification processed: {processed_count}/{len(messages_to_process)} emails stored")
                     
         except Exception as e:
-            logger.error(f"Error handling Gmail notification: {e}")
+            logger.error(f"Error handling Gmail notification: {e}", exc_info=True)
 
 
 auth_service = AuthService()

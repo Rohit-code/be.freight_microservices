@@ -1,6 +1,6 @@
 """Email model - stored in Vector DB with metadata"""
-from pydantic import BaseModel
-from typing import Optional
+from pydantic import BaseModel, ConfigDict
+from typing import Optional, Dict, Any
 from datetime import datetime
 
 
@@ -34,12 +34,14 @@ class Email(BaseModel):
     is_processed: bool = False  # For AI processing
     is_rate_sheet: bool = False  # Detected as rate sheet
     
+    # Auto-drafted response (from rate sheet service)
+    drafted_response: Optional[Dict[str, Any]] = None
+    
     # Timestamps
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class EmailCreate(BaseModel):

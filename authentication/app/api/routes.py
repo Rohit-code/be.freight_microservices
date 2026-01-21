@@ -698,6 +698,91 @@ async def internal_gmail_detail(
 
 # ========== GMAIL WEBHOOK (PUB/SUB PUSH NOTIFICATIONS) ==========
 
+@router.get("/gmail/webhook/test")
+async def gmail_webhook_test():
+    """Test endpoint to verify webhook endpoint is accessible"""
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info("✅ Webhook test endpoint called - webhook endpoint is accessible!")
+    return {
+        "status": "ok",
+        "message": "Webhook endpoint is accessible",
+        "endpoint": "/api/auth/gmail/webhook",
+        "note": "This confirms the endpoint is reachable. Use POST method for actual webhooks."
+    }
+
+
+@router.post("/gmail/webhook/test-manual")
+async def gmail_webhook_test_manual(request: Request):
+    """
+    Manual test endpoint to simulate Pub/Sub webhook.
+    Use this to test the webhook handler with a real payload format.
+    
+    Body should contain:
+    {
+        "email_address": "your-email@company.com",
+        "history_id": "123456"
+    }
+    """
+    import base64
+    import json
+    import logging
+    
+    logger = logging.getLogger(__name__)
+    
+    try:
+        body_data = await request.json()
+        email_address = body_data.get('email_address')
+        history_id = body_data.get('history_id', '123456')
+        
+        if not email_address:
+            return {
+                "status": "error",
+                "message": "Missing email_address in body"
+            }
+        
+        # Create a Pub/Sub-like payload
+        notification_data = {
+            "emailAddress": email_address,
+            "historyId": history_id
+        }
+        
+        # Encode to base64 (like Pub/Sub does)
+        import base64
+        data_b64 = base64.b64encode(json.dumps(notification_data).encode()).decode()
+        
+        # Create Pub/Sub message format
+        pubsub_payload = {
+            "message": {
+                "data": data_b64,
+                "messageId": "test-manual-123",
+                "publishTime": "2024-01-21T10:00:00Z"
+            },
+            "subscription": "projects/test/subscriptions/gmail-notifications-sub"
+        }
+        
+        logger.info("🧪 Manual webhook test - simulating Pub/Sub payload")
+        logger.info(f"Email: {email_address}, HistoryId: {history_id}")
+        
+        # Call the actual webhook handler
+        await auth_service.handle_gmail_notification(email_address, history_id)
+        
+        return {
+            "status": "ok",
+            "message": "Manual webhook test completed",
+            "email_address": email_address,
+            "history_id": history_id,
+            "note": "Check server logs for processing details"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in manual webhook test: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+
 @router.post("/gmail/webhook")
 async def gmail_webhook(request: Request):
     """
@@ -711,35 +796,64 @@ async def gmail_webhook(request: Request):
     
     logger = logging.getLogger(__name__)
     
+    # Log webhook received with full details
+    logger.info("=" * 80)
+    logger.info("GMAIL WEBHOOK RECEIVED")
+    logger.info(f"Request method: {request.method}")
+    logger.info(f"Request URL: {request.url}")
+    logger.info(f"Request headers: {dict(request.headers)}")
+    
     try:
         body = await request.json()
-        logger.info(f"Gmail webhook received: {json.dumps(body)[:200]}")
+        logger.info(f"Webhook body received: {json.dumps(body)[:500]}")
         
         # Extract the Pub/Sub message
         message = body.get('message', {})
         if not message:
-            logger.warning("No message in webhook payload")
+            logger.warning("⚠️  No message in webhook payload")
+            logger.warning(f"Full body: {json.dumps(body)}")
             return {"status": "ok", "message": "No message"}
+        
+        logger.info(f"Pub/Sub message extracted: {json.dumps(message)[:300]}")
         
         # Decode the data (base64 encoded)
         data_b64 = message.get('data', '')
-        if data_b64:
-            data = json.loads(base64.b64decode(data_b64).decode('utf-8'))
-            email_address = data.get('emailAddress')
-            history_id = data.get('historyId')
-            
-            logger.info(f"Gmail notification for {email_address}, historyId: {history_id}")
-            
-            if email_address and history_id:
-                # Find user by email and trigger email fetch
-                await auth_service.handle_gmail_notification(email_address, history_id)
+        if not data_b64:
+            logger.warning("⚠️  No data field in Pub/Sub message")
+            return {"status": "ok", "message": "No data"}
+        
+        logger.info(f"Decoding base64 data (length: {len(data_b64)})")
+        data = json.loads(base64.b64decode(data_b64).decode('utf-8'))
+        email_address = data.get('emailAddress')
+        history_id = data.get('historyId')
+        
+        logger.info(f"✅ Decoded notification - Email: {email_address}, HistoryId: {history_id}")
+        
+        if not email_address:
+            logger.error("❌ No emailAddress in decoded data")
+            return {"status": "ok", "message": "No email address"}
+        
+        if not history_id:
+            logger.error("❌ No historyId in decoded data")
+            return {"status": "ok", "message": "No history ID"}
+        
+        logger.info(f"🚀 Calling handle_gmail_notification for {email_address}")
+        # Find user by email and trigger email fetch
+        await auth_service.handle_gmail_notification(email_address, history_id)
+        logger.info("✅ handle_gmail_notification completed")
         
         # Always return 200 to acknowledge receipt
+        logger.info("=" * 80)
         return {"status": "ok"}
         
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ JSON decode error: {e}")
+        logger.error(f"Raw body: {await request.body()}")
+        return {"status": "error", "message": f"JSON decode error: {str(e)}"}
     except Exception as e:
-        logger.error(f"Gmail webhook error: {str(e)}")
+        logger.error(f"❌ Gmail webhook error: {str(e)}", exc_info=True)
         # Still return 200 to prevent Pub/Sub retries
+        logger.info("=" * 80)
         return {"status": "error", "message": str(e)}
 
 

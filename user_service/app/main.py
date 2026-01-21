@@ -1,8 +1,14 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
-from .api.routes import router as user_router
+import logging
+from .api.routes import router as user_router, internal_router
 from .core.database import init_db, close_db
 from .services.role_service import initialize_default_roles
+
+# Suppress SQLAlchemy engine logs (they're too verbose)
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
+logging.getLogger("sqlalchemy.dialects").setLevel(logging.WARNING)
 
 
 @asynccontextmanager
@@ -23,6 +29,7 @@ app = FastAPI(
 )
 
 app.include_router(user_router)
+app.include_router(internal_router)
 
 
 @app.get("/health")

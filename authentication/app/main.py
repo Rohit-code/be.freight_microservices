@@ -1,7 +1,13 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
+import logging
 from .api.routes import router as auth_router
 from .core.database import init_db, close_db
+
+# Suppress SQLAlchemy engine logs (they're too verbose)
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
+logging.getLogger("sqlalchemy.dialects").setLevel(logging.WARNING)
 
 
 @asynccontextmanager

@@ -49,6 +49,9 @@ from ..core.config import settings
 
 router = APIRouter(prefix="/api/user", tags=["user"])
 
+# Internal endpoints (service-to-service, no auth required for internal use)
+internal_router = APIRouter(prefix="/api/user/internal", tags=["user-internal"])
+
 
 async def get_current_user_profile(authorization: str):
     """Helper to get current user profile from token"""
@@ -764,3 +767,32 @@ async def list_organization_profiles(
     
     profiles = await list_user_profiles(organization_id=organization_id, include_deleted=include_deleted)
     return profiles
+
+
+# ========== INTERNAL ENDPOINTS (Service-to-Service) ==========
+
+@internal_router.get("/user/{auth_user_id}/organization-id")
+async def get_user_organization_id_internal(auth_user_id: int):
+    """
+    Internal endpoint: Get organization_id for a user by auth_user_id.
+    Used by other services (like auth service) to get user's organization.
+    No auth required - internal service-to-service call.
+    """
+    try:
+        # Get user profile by auth_user_id
+        user_profile = await get_user_profile(auth_user_id)
+        if not user_profile:
+            return {"organization_id": None, "message": "User profile not found"}
+        
+        # Get user's organizations
+        user_orgs = await get_user_organizations(user_profile.id)
+        if not user_orgs:
+            return {"organization_id": None, "message": "User has no organizations"}
+        
+        # Return first organization ID (users can only belong to one)
+        organization_id = user_orgs[0].organization_id
+        return {"organization_id": organization_id, "organization_name": user_orgs[0].organization.name}
+        
+    except Exception as e:
+        logger.error(f"Error getting organization_id for auth_user_id {auth_user_id}: {e}")
+        return {"organization_id": None, "error": str(e)}

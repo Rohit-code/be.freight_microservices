@@ -58,3 +58,8 @@ torch>=2.0.0
 
 # Background task scheduler
 apscheduler>=3.10.0
+
+# Excel/CSV parsing for rate sheets
+pandas>=2.0.0
+openpyxl>=3.1.0
+xlrd>=2.0.0

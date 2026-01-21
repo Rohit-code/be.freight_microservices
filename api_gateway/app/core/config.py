@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     VECTOR_DB_SERVICE_URL: str = "http://localhost:8004"
     EMAIL_SERVICE_URL: str = "http://localhost:8005"
     USER_SERVICE_URL: str = "http://localhost:8006"
+    RATE_SHEET_SERVICE_URL: str = "http://localhost:8010"
     
     class Config:
         env_file = str(ENV_FILE) if ENV_FILE.exists() else None

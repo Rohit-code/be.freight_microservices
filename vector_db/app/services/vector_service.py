@@ -85,26 +85,58 @@ class VectorCollection:
         return np.array(embeddings)
     
     def add(self, documents: List[str], metadatas: List[Dict[str, Any]], ids: List[str]):
-        """Add documents to collection with embeddings"""
+        """Add documents to collection with embeddings. Updates existing documents if ID already exists."""
         if not documents:
             return
         
-        # Create embeddings for new documents
-        new_embeddings = self._create_embeddings(documents)
+        # Check for existing IDs and update them instead of creating duplicates
+        new_documents = []
+        new_metadatas = []
+        new_ids = []
+        indices_to_update = []
         
-        # Append to existing data
-        self.documents.extend(documents)
-        self.metadatas.extend(metadatas)
-        self.ids.extend(ids)
+        for i, doc_id in enumerate(ids):
+            try:
+                existing_idx = self.ids.index(doc_id)
+                # Document exists - update it instead of creating duplicate
+                indices_to_update.append((existing_idx, i))
+            except ValueError:
+                # Document doesn't exist - will be added as new
+                new_documents.append(documents[i])
+                new_metadatas.append(metadatas[i] if metadatas else {})
+                new_ids.append(doc_id)
         
-        # Update embeddings array
-        if self.embeddings is None:
-            self.embeddings = new_embeddings
-        else:
-            self.embeddings = np.vstack([self.embeddings, new_embeddings])
+        # Update existing documents
+        for existing_idx, new_idx in indices_to_update:
+            self.documents[existing_idx] = documents[new_idx]
+            self.metadatas[existing_idx] = metadatas[new_idx] if metadatas else {}
+            # Regenerate embedding for updated document
+            new_embedding = self._create_embeddings([documents[new_idx]])
+            if self.embeddings is not None:
+                self.embeddings[existing_idx] = new_embedding[0]
+        
+        # Add new documents
+        if new_documents:
+            new_embeddings = self._create_embeddings(new_documents)
+            
+            # Append to existing data
+            self.documents.extend(new_documents)
+            self.metadatas.extend(new_metadatas)
+            self.ids.extend(new_ids)
+            
+            # Update embeddings array
+            if self.embeddings is None:
+                self.embeddings = new_embeddings
+            else:
+                self.embeddings = np.vstack([self.embeddings, new_embeddings])
         
         self._save()
-        logger.info(f"Added {len(documents)} documents to collection '{self.name}'")
+        updated_count = len(indices_to_update)
+        added_count = len(new_documents)
+        if updated_count > 0:
+            logger.info(f"Updated {updated_count} existing document(s) and added {added_count} new document(s) to collection '{self.name}'")
+        else:
+            logger.info(f"Added {added_count} documents to collection '{self.name}'")
     
     def query(self, query_texts: List[str], n_results: int = 10) -> Dict[str, Any]:
         """Query collection for similar documents using cosine similarity"""
