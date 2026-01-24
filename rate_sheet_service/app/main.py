@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import logging
 import sys
+import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -9,48 +9,72 @@ from app.core.config import settings
 from app.core.database import init_db, close_db
 from app.api.routes import router
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-# Try to import shared error handlers
+# Set up shared logging configuration with fallback
 SHARED_PATH = Path(__file__).parent.parent.parent.parent / "shared"
 if str(SHARED_PATH) not in sys.path:
     sys.path.insert(0, str(SHARED_PATH))
 
+# Try to import shared logging, fallback to basic logging
+try:
+    from logging_config import setup_service_logging, log_service_startup, log_service_ready, log_dependency_status
+    logger = setup_service_logging("rate-sheet", suppress_warnings=True)
+    USE_SHARED_LOGGING = True
+except ImportError:
+    # Fallback to basic logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
+    logger = logging.getLogger("rate-sheet")
+    USE_SHARED_LOGGING = False
+
+# Try to import shared error handlers
 try:
     from error_handlers import register_error_handlers
     ERROR_HANDLERS_AVAILABLE = True
 except ImportError:
     ERROR_HANDLERS_AVAILABLE = False
-    logger.warning("Shared error handlers not available, using default FastAPI error handling")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown"""
     # Startup
-    logger.info("Starting Rate Sheet Service (Hybrid Storage: ChromaDB + PostgreSQL)...")
+    if USE_SHARED_LOGGING:
+        log_service_startup(logger, "rate-sheet", 8010, "1.0.0")
+    else:
+        logger.info("🚀 Rate Sheet Service v1.0.0 - Port 8010")
+    
     try:
         await init_db()
-        logger.info("✅ Database initialized successfully")
+        if USE_SHARED_LOGGING:
+            log_dependency_status(logger, "PostgreSQL", "ok")
+        else:
+            logger.info("✅ PostgreSQL: ok")
     except Exception as e:
-        logger.error(f"⚠️  Database initialization failed (non-critical): {e}")
-        logger.info("Continuing with ChromaDB-only mode...")
-    logger.info("Rate Sheet Service started successfully")
+        logger.warning(f"PostgreSQL unavailable, using ChromaDB-only mode: {e}")
+        if USE_SHARED_LOGGING:
+            log_dependency_status(logger, "PostgreSQL", "fallback")
+        else:
+            logger.info("⚠️ PostgreSQL: fallback")
+        
+    if USE_SHARED_LOGGING:
+        log_service_ready(logger, "rate-sheet", "Hybrid storage ready")
+    else:
+        logger.info("✅ Rate Sheet Service Ready (Hybrid storage ready)")
     
     yield
     
     # Shutdown
-    logger.info("Shutting down Rate Sheet Service...")
+    if USE_SHARED_LOGGING:
+        try:
+            from logging_config import log_service_shutdown
+            log_service_shutdown(logger, "rate-sheet")
+        except ImportError:
+            logger.info("🛑 Rate Sheet Service Shutting Down")
+    else:
+        logger.info("🛑 Rate Sheet Service Shutting Down")
     try:
         await close_db()
     except Exception as e:
-        logger.error(f"Error closing database: {e}")
-    logger.info("Rate Sheet Service shut down")
+        logger.error(f"Database cleanup error: {e}")
 
 
 app = FastAPI(

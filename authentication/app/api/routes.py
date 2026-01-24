@@ -135,6 +135,498 @@ async def admin_delete_user(
     return await auth_service.delete_admin_user(token, user_id)
 
 
+@router.get("/admin/schema")
+async def admin_get_schema(
+    authorization: str = Header(default=""),
+):
+    """
+    Admin endpoint: Get database schema information (models and relationships)
+    For developers to understand the data model structure
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authorization header missing or invalid",
+        )
+    token = authorization.replace("Bearer ", "")
+    
+    # Verify admin access
+    try:
+        from ..core.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            await auth_service._get_admin_user(session, token)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required",
+        )
+    
+    # Dynamically introspect SQLAlchemy models
+    from sqlalchemy import inspect as sqlalchemy_inspect
+    from ..models.user import User
+    
+    def get_model_info(model_class):
+        """Introspect a SQLAlchemy model to get schema information dynamically"""
+        try:
+            mapper = sqlalchemy_inspect(model_class)
+            table = mapper.tables[0] if mapper.tables else None
+            
+            if not table:
+                return None
+            
+            fields = []
+            for column in table.columns:
+                col_info = {
+                    "name": column.name,
+                    "type": str(column.type),
+                    "primary_key": column.primary_key,
+                    "unique": column.unique,
+                    "indexed": column.index,
+                    "nullable": column.nullable,
+                }
+                
+                # Get default value
+                if column.default is not None:
+                    if hasattr(column.default, 'arg'):
+                        col_info["default"] = str(column.default.arg)
+                    elif hasattr(column.default, 'value'):
+                        col_info["default"] = str(column.default.value)
+                    else:
+                        col_info["default"] = None
+                else:
+                    col_info["default"] = None
+                
+                # Get docstring or description from column comment if available
+                if hasattr(column, 'comment') and column.comment:
+                    col_info["description"] = column.comment
+                else:
+                    col_info["description"] = None
+                
+                fields.append(col_info)
+            
+            # Get relationships
+            relationships = []
+            for rel_name, rel in mapper.relationships.items():
+                rel_info = {
+                    "name": rel_name,
+                    "type": "many-to-one" if rel.direction.name == "MANYTOONE" else "one-to-many" if rel.direction.name == "ONETOMANY" else "many-to-many",
+                    "target": rel.entity.class_.__name__ if hasattr(rel.entity, 'class_') else str(rel.entity),
+                    "description": f"Relationship: {rel_name}"
+                }
+                relationships.append(rel_info)
+            
+            # Get constraints
+            constraints = []
+            for constraint in table.constraints:
+                if constraint.name and constraint.name.startswith('uq_'):
+                    constraints.append({
+                        "type": "unique",
+                        "name": constraint.name,
+                        "fields": [col.name for col in constraint.columns] if hasattr(constraint, 'columns') else [],
+                        "description": f"Unique constraint: {constraint.name}"
+                    })
+            
+            return {
+                "name": model_class.__name__,
+                "table": table.name,
+                "description": model_class.__doc__.strip() if model_class.__doc__ else f"{model_class.__name__} model",
+                "fields": fields,
+                "relationships": relationships,
+                "constraints": constraints,
+            }
+        except Exception as e:
+            # Log error but don't fail - fallback to static
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to introspect model {model_class.__name__}: {e}")
+            return None
+    
+    # Get authentication service models dynamically
+    auth_models = []
+    try:
+        user_info = get_model_info(User)
+        if user_info:
+            auth_models.append(user_info)
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Failed to introspect User model: {e}")
+        auth_models = []  # Will use static fallback
+    
+    # Define schema information (with dynamic introspection where possible)
+    schema_info = {
+        "services": {
+            "authentication": {
+                "database": "PostgreSQL",
+                "models": auth_models if auth_models else [
+                    {
+                        "name": "User",
+                        "table": "users",
+                        "description": "User authentication and Google OAuth data",
+                        "fields": [
+                            {"name": "id", "type": "Integer", "primary_key": True, "description": "Primary key"},
+                            {"name": "email", "type": "String(255)", "unique": True, "indexed": True, "description": "User email address"},
+                            {"name": "username", "type": "String(150)", "unique": True, "indexed": True, "description": "Username"},
+                            {"name": "password_hash", "type": "String(255)", "nullable": True, "description": "Bcrypt password hash (nullable for Google OAuth users)"},
+                            {"name": "first_name", "type": "String(150)", "nullable": True},
+                            {"name": "last_name", "type": "String(150)", "nullable": True},
+                            {"name": "google_id", "type": "String(255)", "unique": True, "nullable": True, "description": "Google OAuth user ID"},
+                            {"name": "is_google_user", "type": "Boolean", "default": False, "description": "True if user signed up via Google OAuth"},
+                            {"name": "google_access_token", "type": "Text", "nullable": True, "description": "Google OAuth access token"},
+                            {"name": "google_refresh_token", "type": "Text", "nullable": True, "description": "Google OAuth refresh token"},
+                            {"name": "gmail_connected", "type": "Boolean", "default": False, "description": "Gmail integration status"},
+                            {"name": "drive_connected", "type": "Boolean", "default": False, "description": "Google Drive integration status"},
+                            {"name": "is_active", "type": "Boolean", "default": True, "description": "Account active status"},
+                            {"name": "is_staff", "type": "Boolean", "default": False, "description": "Staff/admin access"},
+                            {"name": "is_superuser", "type": "Boolean", "default": False, "description": "Superuser access"},
+                            {"name": "created_at", "type": "DateTime(timezone=True)", "description": "Account creation timestamp"},
+                            {"name": "updated_at", "type": "DateTime(timezone=True)", "description": "Last update timestamp"},
+                            {"name": "last_login", "type": "DateTime(timezone=True)", "nullable": True, "description": "Last login timestamp"},
+                        ],
+                        "relationships": [],
+                        "notes": "Core user authentication model. Links to UserProfile in user_service via auth_user_id."
+                    }
+                ],
+                "introspection_status": "dynamic" if auth_models else "static_fallback"
+            },
+            "user_service": {
+                "database": "PostgreSQL",
+                "models": [
+                    {
+                        "name": "UserProfile",
+                        "table": "user_profiles",
+                        "description": "Extended user profile linked to auth service User",
+                        "fields": [
+                            {"name": "id", "type": "Integer", "primary_key": True},
+                            {"name": "auth_user_id", "type": "Integer", "unique": True, "indexed": True, "description": "Foreign key to authentication.users.id"},
+                            {"name": "email", "type": "String(255)", "indexed": True, "description": "Denormalized email for quick access"},
+                            {"name": "first_name", "type": "String(150)", "nullable": True},
+                            {"name": "last_name", "type": "String(150)", "nullable": True},
+                            {"name": "department", "type": "Enum", "nullable": True, "values": ["ops", "sales", "admin"]},
+                            {"name": "signature", "type": "Text", "nullable": True, "description": "Email footer signature"},
+                            {"name": "is_enabled", "type": "Boolean", "default": True, "description": "Enable/disable user"},
+                            {"name": "deleted_at", "type": "DateTime(timezone=True)", "nullable": True, "description": "Soft delete timestamp"},
+                        ],
+                        "relationships": [
+                            {"type": "one-to-many", "target": "UserOrganization", "description": "User can belong to multiple organizations"}
+                        ]
+                    },
+                    {
+                        "name": "Organization",
+                        "table": "organizations",
+                        "description": "Company/Organization model for multi-tenant isolation",
+                        "fields": [
+                            {"name": "id", "type": "Integer", "primary_key": True},
+                            {"name": "name", "type": "String(255)", "indexed": True},
+                            {"name": "slug", "type": "String(255)", "unique": True, "indexed": True, "description": "URL-friendly identifier"},
+                            {"name": "domain", "type": "String(255)", "indexed": True, "description": "Company domain (required)"},
+                            {"name": "admin_email", "type": "String(255)", "indexed": True, "description": "Organization admin email"},
+                            {"name": "industry_type", "type": "Enum", "nullable": True, "values": ["freight_forwarder", "cha", "exporter"]},
+                            {"name": "timezone", "type": "String(100)", "default": "UTC"},
+                            {"name": "default_currency", "type": "String(10)", "default": "USD"},
+                            {"name": "status", "type": "Enum", "default": "active", "values": ["active", "suspended"]},
+                            {"name": "emails_per_day_limit", "type": "Integer", "nullable": True, "description": "Daily email limit"},
+                            {"name": "ai_usage_limit", "type": "Integer", "nullable": True, "description": "AI API calls per day"},
+                            {"name": "auto_send_threshold", "type": "Integer", "default": 95, "description": "Confidence threshold for auto-send"},
+                            {"name": "manual_review_threshold", "type": "Integer", "default": 70, "description": "Confidence threshold for manual review"},
+                        ],
+                        "relationships": [
+                            {"type": "one-to-many", "target": "UserOrganization", "description": "Organization has many users"},
+                            {"type": "one-to-many", "target": "Invitation", "description": "Organization has many invitations"}
+                        ]
+                    },
+                    {
+                        "name": "UserOrganization",
+                        "table": "user_organizations",
+                        "description": "Many-to-many relationship between UserProfile and Organization with Role",
+                        "fields": [
+                            {"name": "id", "type": "Integer", "primary_key": True},
+                            {"name": "user_profile_id", "type": "Integer", "foreign_key": "user_profiles.id", "indexed": True},
+                            {"name": "organization_id", "type": "Integer", "foreign_key": "organizations.id", "indexed": True},
+                            {"name": "role_id", "type": "Integer", "foreign_key": "roles.id", "indexed": True},
+                            {"name": "is_active", "type": "Boolean", "default": True},
+                            {"name": "joined_at", "type": "DateTime(timezone=True)", "description": "When user joined organization"},
+                        ],
+                        "relationships": [
+                            {"type": "many-to-one", "target": "UserProfile", "description": "Belongs to UserProfile"},
+                            {"type": "many-to-one", "target": "Organization", "description": "Belongs to Organization"},
+                            {"type": "many-to-one", "target": "Role", "description": "Has a Role"}
+                        ],
+                        "constraints": [
+                            {"type": "unique", "fields": ["user_profile_id", "organization_id"], "description": "One user can only have one role per organization"}
+                        ]
+                    },
+                    {
+                        "name": "Role",
+                        "table": "roles",
+                        "description": "Role model - admin, employee, manager",
+                        "fields": [
+                            {"name": "id", "type": "Integer", "primary_key": True},
+                            {"name": "name", "type": "String(100)", "unique": True, "indexed": True, "description": "admin, employee, manager"},
+                            {"name": "display_name", "type": "String(150)", "description": "Admin, Employee, Manager"},
+                            {"name": "description", "type": "Text", "nullable": True},
+                        ],
+                        "relationships": [
+                            {"type": "one-to-many", "target": "UserOrganization", "description": "Role assigned to users in organizations"},
+                            {"type": "one-to-many", "target": "RolePermission", "description": "Role has permissions"}
+                        ]
+                    },
+                    {
+                        "name": "Invitation",
+                        "table": "invitations",
+                        "description": "Invitation model for inviting users to organizations",
+                        "fields": [
+                            {"name": "id", "type": "Integer", "primary_key": True},
+                            {"name": "organization_id", "type": "Integer", "foreign_key": "organizations.id", "indexed": True},
+                            {"name": "invited_by_user_id", "type": "Integer", "indexed": True, "description": "UserProfile ID who sent invitation"},
+                            {"name": "email", "type": "String(255)", "indexed": True, "description": "Invited email address"},
+                            {"name": "token", "type": "String(255)", "unique": True, "indexed": True, "description": "Unique invitation token"},
+                            {"name": "role_id", "type": "Integer", "foreign_key": "roles.id", "description": "Role to assign when accepted"},
+                            {"name": "is_accepted", "type": "Boolean", "default": False, "indexed": True},
+                            {"name": "expires_at", "type": "DateTime(timezone=True)", "indexed": True, "description": "Invitation expiry"},
+                        ],
+                        "relationships": [
+                            {"type": "many-to-one", "target": "Organization", "description": "Belongs to Organization"},
+                            {"type": "many-to-one", "target": "Role", "description": "Has a Role"}
+                        ]
+                    }
+                ],
+                "notes": "Multi-tenant SaaS model. Organizations isolate data. UserProfile links to authentication.users via auth_user_id."
+            },
+            "rate_sheet_service": {
+                "database": "PostgreSQL",
+                "models": [
+                    {
+                        "name": "RateSheetStructuredData",
+                        "table": "rate_sheet_structured_data",
+                        "description": "Structured rate sheet data for precise querying (complements ChromaDB)",
+                        "fields": [
+                            {"name": "rate_sheet_id", "type": "String(36)", "primary_key": True, "description": "Links to ChromaDB document ID"},
+                            {"name": "organization_id", "type": "Integer", "indexed": True, "description": "Multi-tenant isolation"},
+                            {"name": "user_id", "type": "Integer", "description": "User who uploaded"},
+                            {"name": "file_name", "type": "String(500)", "description": "Original file name"},
+                            {"name": "carrier_name", "type": "String(255)", "indexed": True, "nullable": True},
+                            {"name": "rate_sheet_type", "type": "String(50)", "nullable": True, "description": "ocean_freight, air_freight, etc."},
+                            {"name": "routes", "type": "JSON", "description": "Array of route objects"},
+                            {"name": "pricing_tiers", "type": "JSON", "nullable": True, "description": "Array of pricing tier objects"},
+                            {"name": "surcharges", "type": "JSON", "nullable": True, "description": "Array of surcharge objects"},
+                            {"name": "valid_from", "type": "DateTime(timezone=True)", "indexed": True, "nullable": True},
+                            {"name": "valid_to", "type": "DateTime(timezone=True)", "indexed": True, "nullable": True},
+                        ],
+                        "relationships": [],
+                        "notes": "Hybrid storage: ChromaDB (semantic search) + PostgreSQL (structured queries). rate_sheet_id links to ChromaDB document."
+                    }
+                ]
+            },
+            "email_service": {
+                "database": "ChromaDB (Vector DB)",
+                "models": [
+                    {
+                        "name": "Email",
+                        "collection": "emails",
+                        "description": "Email model stored in ChromaDB with BGE embeddings",
+                        "storage": {
+                            "type": "Vector Database (ChromaDB)",
+                            "embedding_model": "BAAI/bge-base-en-v1.5",
+                            "storage_format": "Pickle files (.pkl) in vector_db directory"
+                        },
+                        "fields": [
+                            {"name": "id", "type": "String (UUID)", "description": "ChromaDB document ID"},
+                            {"name": "user_id", "type": "Integer", "description": "Reference to authentication.users.id"},
+                            {"name": "gmail_message_id", "type": "String", "description": "Gmail API message ID"},
+                            {"name": "gmail_thread_id", "type": "String", "nullable": True, "description": "Gmail thread ID"},
+                            {"name": "subject", "type": "String", "nullable": True},
+                            {"name": "from_email", "type": "String", "nullable": True},
+                            {"name": "to_email", "type": "String", "nullable": True},
+                            {"name": "body_html", "type": "String", "nullable": True, "description": "Full HTML email body"},
+                            {"name": "body_plain", "type": "String", "nullable": True, "description": "Plain text email body"},
+                            {"name": "snippet", "type": "String", "nullable": True, "description": "Email preview snippet"},
+                            {"name": "is_read", "type": "Boolean", "default": False},
+                            {"name": "is_processed", "type": "Boolean", "default": False, "description": "AI processing status"},
+                            {"name": "is_rate_sheet", "type": "Boolean", "default": False, "description": "Detected as rate sheet"},
+                            {"name": "drafted_response", "type": "JSON", "nullable": True, "description": "Auto-drafted AI response"},
+                        ],
+                        "relationships": [
+                            {"type": "many-to-one", "target": "User (auth service)", "description": "Emails belong to users (user-level privacy)"}
+                        ],
+                        "notes": "Emails are USER-SPECIFIC and PRIVATE. Unlike rate sheets (org-wide), emails are NOT shared within organizations."
+                    }
+                ]
+            },
+            "rate_sheet_service_vector": {
+                "database": "ChromaDB (Vector DB)",
+                "models": [
+                    {
+                        "name": "RateSheet",
+                        "collection": "rate_sheets",
+                        "description": "Rate sheet documents stored in ChromaDB with BGE embeddings",
+                        "storage": {
+                            "type": "Vector Database (ChromaDB)",
+                            "embedding_model": "BAAI/bge-base-en-v1.5",
+                            "storage_format": "Pickle files (.pkl) in vector_db directory"
+                        },
+                        "fields": [
+                            {"name": "id", "type": "String (UUID)", "description": "ChromaDB document ID"},
+                            {"name": "organization_id", "type": "Integer", "description": "Multi-tenant isolation (REQUIRED)"},
+                            {"name": "user_id", "type": "Integer", "description": "User who uploaded"},
+                            {"name": "file_name", "type": "String", "description": "Original file name"},
+                            {"name": "carrier_name", "type": "String", "nullable": True},
+                            {"name": "document", "type": "String", "description": "Full raw rate sheet content"},
+                            {"name": "metadata", "type": "JSON", "description": "Structured metadata (carrier, routes, etc.)"},
+                        ],
+                        "relationships": [
+                            {"type": "many-to-one", "target": "Organization (user service)", "description": "Rate sheets belong to organizations (org-level isolation)"}
+                        ],
+                        "notes": "Rate sheets are ORGANIZATION-WIDE. Users within an organization can see ALL rate sheets from their organization."
+                    }
+                ]
+            }
+        },
+        "data_isolation": {
+            "emails": {
+                "level": "user",
+                "description": "Emails are user-private. Users can only see their own emails, even within the same organization."
+            },
+            "rate_sheets": {
+                "level": "organization",
+                "description": "Rate sheets are organization-wide. Users within an organization share access to all rate sheets."
+            }
+        },
+        "architecture_notes": [
+            "Authentication Service: Manages user authentication, Google OAuth, and Gmail webhooks",
+            "User Service: Manages organizations, user profiles, roles, and permissions (multi-tenant SaaS)",
+            "Email Service: Stores emails in ChromaDB with semantic search capabilities",
+            "Rate Sheet Service: Hybrid storage - ChromaDB for semantic search, PostgreSQL for structured queries",
+            "Vector DB Service: Provides ChromaDB functionality using Sentence Transformers (BGE model)",
+            "AI Service: Provides OpenAI GPT-4o-mini for re-ranking and email drafting",
+            "Data flows: Gmail Webhook → Auth Service → Email Service → Vector DB → ChromaDB",
+            "Rate Sheet Upload → Rate Sheet Service → ChromaDB (embeddings) + PostgreSQL (structured data)"
+        ],
+        "introspection_info": {
+            "authentication_service": "dynamic" if auth_models else "static_fallback",
+            "note": "Schema is automatically generated from SQLAlchemy models. Changes to models will be reflected automatically."
+        }
+    }
+    
+    return schema_info
+
+
+@router.get("/admin/chromadb")
+async def admin_get_chromadb_info(
+    authorization: str = Header(default=""),
+    collection: Optional[str] = Query(None, description="Specific collection name (emails, rate_sheets)"),
+    sample_size: int = Query(default=5, ge=1, le=50, description="Number of sample documents to return"),
+):
+    """
+    Admin endpoint: Get ChromaDB collection structure and sample data
+    For developers to understand how data is stored in ChromaDB
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authorization header missing or invalid",
+        )
+    token = authorization.replace("Bearer ", "")
+    
+    # Verify admin access
+    try:
+        from ..core.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            await auth_service._get_admin_user(session, token)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required",
+        )
+    
+    import httpx
+    from ..core.config import settings
+    
+    # Vector DB service URL (default if not in config)
+    vector_db_url = getattr(settings, 'VECTOR_DB_SERVICE_URL', 'http://localhost:8004')
+    
+    collections_to_check = [collection] if collection else ["emails", "rate_sheets"]
+    chromadb_info = {}
+    
+    async with httpx.AsyncClient() as client:
+        for coll_name in collections_to_check:
+            try:
+                # Get collection info
+                info_response = await client.get(
+                    f"{vector_db_url}/api/vector/collections/{coll_name}",
+                    timeout=10.0
+                )
+                
+                collection_info = {}
+                if info_response.status_code == 200:
+                    info_data = info_response.json()
+                    collection_info = {
+                        "exists": True,
+                        "count": info_data.get("count", 0),
+                        "name": coll_name,
+                    }
+                    
+                    # Get sample documents
+                    if info_data.get("count", 0) > 0:
+                        sample_response = await client.post(
+                            f"{vector_db_url}/api/vector/collections/{coll_name}/query",
+                            json={
+                                "query_texts": ["sample"],
+                                "n_results": min(sample_size, info_data.get("count", 0))
+                            },
+                            timeout=30.0
+                        )
+                        
+                        if sample_response.status_code == 200:
+                            sample_data = sample_response.json()
+                            results = sample_data.get("results", {})
+                            ids = results.get("ids", [[]])[0]
+                            metadatas = results.get("metadatas", [[]])[0]
+                            documents = results.get("documents", [[]])[0]
+                            
+                            samples = []
+                            for i in range(min(len(ids), sample_size)):
+                                sample_doc = {
+                                    "id": ids[i],
+                                    "metadata": metadatas[i] if i < len(metadatas) else {},
+                                    "document_preview": (documents[i][:500] if documents and i < len(documents) else "") + ("..." if documents and i < len(documents) and len(documents[i]) > 500 else ""),
+                                    "document_length": len(documents[i]) if documents and i < len(documents) else 0,
+                                }
+                                samples.append(sample_doc)
+                            
+                            collection_info["samples"] = samples
+                            collection_info["sample_count"] = len(samples)
+                else:
+                    collection_info = {
+                        "exists": False,
+                        "name": coll_name,
+                        "error": f"Collection not found or error: {info_response.status_code}"
+                    }
+                
+                chromadb_info[coll_name] = collection_info
+                
+            except Exception as e:
+                chromadb_info[coll_name] = {
+                    "exists": False,
+                    "name": coll_name,
+                    "error": str(e)
+                }
+    
+    return {
+        "chromadb_info": chromadb_info,
+        "storage_location": vector_db_url,
+        "embedding_model": "BAAI/bge-base-en-v1.5",
+        "storage_format": "Pickle files (.pkl) in vector_db directory",
+        "notes": [
+            "ChromaDB collections are stored as pickle files (.pkl) in the vector_db directory",
+            "Each collection contains: documents (text), metadatas (JSON), ids (UUIDs), and embeddings (numpy arrays)",
+            "Embeddings are generated using BGE (BAAI/bge-base-en-v1.5) model for semantic search",
+            "emails collection: User-private emails with full content and metadata",
+            "rate_sheets collection: Organization-wide rate sheets with full document content and metadata"
+        ]
+    }
+
+
 # ========== GMAIL API ENDPOINTS ==========
 
 @router.get("/gmail/list")

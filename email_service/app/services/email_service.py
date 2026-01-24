@@ -138,6 +138,19 @@ async def draft_email_response_auto(email_data: EmailCreate, organization_id: in
             logger.debug(f"No email query content for auto-draft (email: {email_data.gmail_message_id})")
             return None
         
+        # Quick pre-check: Skip obvious non-freight emails
+        email_text_lower = email_query.lower()
+        skip_keywords = [
+            'linkedin', 'notification', 'newsletter', 'unsubscribe',
+            'shared a post', 'commented on', 'liked your', 'followed you',
+            'facebook', 'twitter', 'instagram', 'social media',
+            'do not reply', 'noreply', 'automated',
+        ]
+        
+        if any(keyword in email_text_lower for keyword in skip_keywords):
+            logger.info(f"Skipping auto-draft for email {email_data.gmail_message_id} - appears to be notification/newsletter")
+            return None
+        
         logger.info(f"Auto-drafting response for email {email_data.gmail_message_id}, org_id: {organization_id}")
         
         # Use longer timeout for draft generation (search + re-rank + AI response can take time)
@@ -156,7 +169,21 @@ async def draft_email_response_auto(email_data: EmailCreate, organization_id: in
             
             if draft_response.status_code == 200:
                 draft_data = draft_response.json()
-                logger.info(f"Successfully auto-drafted response for email {email_data.gmail_message_id}")
+                
+                # Check if draft was skipped (not a freight inquiry or low confidence)
+                if draft_data.get("skipped"):
+                    logger.info(f"Auto-draft skipped for email {email_data.gmail_message_id}: {draft_data.get('skip_reason', 'Unknown reason')}")
+                    return None  # Don't store skipped drafts
+                
+                # Check confidence threshold - don't auto-draft if confidence is too low
+                confidence = draft_data.get("confidence_score", 0.0)
+                MIN_AUTO_DRAFT_CONFIDENCE = 0.50  # 50% minimum for auto-drafting
+                
+                if confidence < MIN_AUTO_DRAFT_CONFIDENCE:
+                    logger.info(f"Auto-draft skipped for email {email_data.gmail_message_id} - confidence too low ({confidence:.2%} < {MIN_AUTO_DRAFT_CONFIDENCE:.2%})")
+                    return None  # Don't auto-draft low confidence responses
+                
+                logger.info(f"Successfully auto-drafted response for email {email_data.gmail_message_id} (confidence: {confidence:.2%})")
                 return draft_data
             else:
                 error_text = draft_response.text[:500] if hasattr(draft_response, 'text') else "No error text"
@@ -530,50 +557,43 @@ async def get_user_emails(user_id: int, limit: int = 100, is_read: Optional[bool
     """Get emails for a user"""
     try:
         async with httpx.AsyncClient() as client:
-            # Use multiple generic queries to ensure we get all emails
-            # Try different queries to maximize recall
-            query_terms = [
-                "email message",
-                "mail inbox",
-                "message",
-                "email",
-                "inbox"
-            ]
-            
+            # OPTIMIZED: Use a single generic query instead of multiple queries
+            # This reduces overhead from 5 queries to 1 query
+            # Request enough results to cover all user's emails (most users won't have more than limit*3 emails)
             all_emails_dict = {}  # Use dict to avoid duplicates by email ID
             
-            for query_term in query_terms:
-                try:
-                    response = await client.post(
-                        f"{settings.VECTOR_DB_SERVICE_URL}/api/vector/collections/{EMAILS_COLLECTION}/query",
-                        json={
-                            "query_texts": [query_term],
-                            "n_results": limit * 2  # Get more to filter
-                        },
-                        timeout=30.0
-                    )
+            try:
+                # Single query with a generic term that matches all emails
+                response = await client.post(
+                    f"{settings.VECTOR_DB_SERVICE_URL}/api/vector/collections/{EMAILS_COLLECTION}/query",
+                    json={
+                        "query_texts": ["email"],  # Single generic query
+                        "n_results": limit * 3  # Get enough to cover all user's emails
+                    },
+                    timeout=30.0
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    results = data.get("results", {})
+                    ids = results.get("ids", [[]])[0]
+                    metadatas = results.get("metadatas", [[]])[0]
+                    documents = results.get("documents", [[]])[0]
                     
-                    if response.status_code == 200:
-                        data = response.json()
-                        results = data.get("results", {})
-                        ids = results.get("ids", [[]])[0]
-                        metadatas = results.get("metadatas", [[]])[0]
-                        documents = results.get("documents", [[]])[0]
-                        
-                        # Add emails that match user_id to our dict
-                        for i, meta in enumerate(metadatas):
-                            if str(meta.get("user_id")) == str(user_id):
-                                email_id = ids[i]
-                                if email_id not in all_emails_dict:
-                                    if is_read is None or meta.get("is_read") == is_read:
-                                        all_emails_dict[email_id] = _metadata_to_email(
-                                            ids[i], 
-                                            meta, 
-                                            documents[i] if documents else ""
-                                        )
-                except Exception as e:
-                    logger.debug(f"Error querying with term '{query_term}': {e}")
-                    continue
+                    # Add emails that match user_id to our dict
+                    for i, meta in enumerate(metadatas):
+                        if str(meta.get("user_id")) == str(user_id):
+                            email_id = ids[i]
+                            if email_id not in all_emails_dict:
+                                if is_read is None or meta.get("is_read") == is_read:
+                                    all_emails_dict[email_id] = _metadata_to_email(
+                                        ids[i], 
+                                        meta, 
+                                        documents[i] if documents else ""
+                                    )
+            except Exception as e:
+                logger.debug(f"Error querying emails: {e}")
+                # Continue even if query fails - return what we have
             
             # Convert dict to list and sort by date (newest first)
             emails = list(all_emails_dict.values())

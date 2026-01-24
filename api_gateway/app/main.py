@@ -9,10 +9,21 @@ from pathlib import Path
 from app.core.config import settings
 from app.utils.proxy import proxy_request
 
-# Try to import shared error handlers
+# Set up shared logging configuration with fallback
 SHARED_PATH = Path(__file__).parent.parent.parent.parent / "shared"
 if str(SHARED_PATH) not in sys.path:
     sys.path.insert(0, str(SHARED_PATH))
+
+# Try to import shared logging, fallback to basic logging
+try:
+    from logging_config import setup_service_logging, log_service_startup, log_service_ready
+    logger = setup_service_logging("gateway", log_level="INFO", suppress_warnings=True)
+    USE_SHARED_LOGGING = True
+except ImportError:
+    # Fallback to basic logging (keep INFO level for webhook debugging)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
+    logger = logging.getLogger("gateway")
+    USE_SHARED_LOGGING = False
 
 try:
     from error_handlers import register_error_handlers
@@ -20,13 +31,20 @@ try:
 except ImportError:
     ERROR_HANDLERS_AVAILABLE = False
 
-logger = logging.getLogger(__name__)
-
 app = FastAPI(
     title="Freight Forwarder API Gateway",
     description="API Gateway for Freight Forwarder Microservices",
     version="1.0.0"
 )
+
+@app.on_event("startup")
+async def startup_event():
+    if USE_SHARED_LOGGING:
+        log_service_startup(logger, "gateway", 8000, "1.0.0")
+        log_service_ready(logger, "gateway", "Proxy routes configured")
+    else:
+        logger.info("🚀 Gateway Service v1.0.0 - Port 8000")
+        logger.info("✅ Gateway Service Ready (Proxy routes configured)")
 
 # Register error handlers if available
 if ERROR_HANDLERS_AVAILABLE:

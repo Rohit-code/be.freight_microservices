@@ -76,8 +76,11 @@ class AuthService:
                                     "http://localhost:8005/api/email/fetch",
                                     json={"user_id": user.id},
                                     headers={"Authorization": f"Bearer {token}"},
-                                    timeout=5.0
+                                    timeout=60.0  # Increased timeout - email fetch can take time
                                 )
+                        except httpx.ReadTimeout:
+                            # Timeout is acceptable - email fetch is non-blocking background task
+                            logger.warning(f"Email fetch timed out on login (non-critical, will retry later)")
                         except Exception as e:
                             # Log but don't block login if email service is unavailable
                             logger.warning(f"Failed to trigger email fetch on login: {e}", exc_info=True)
@@ -299,8 +302,11 @@ class AuthService:
                                         "http://localhost:8005/api/email/fetch",
                                         json={"user_id": user.id},
                                         headers={"Authorization": f"Bearer {token}"},
-                                        timeout=5.0
+                                        timeout=60.0  # Increased timeout - email fetch can take time
                                     )
+                            except httpx.ReadTimeout:
+                                # Timeout is acceptable - email fetch is non-blocking background task
+                                logger.warning(f"Email fetch timed out on login (non-critical, will retry later)")
                             except Exception as e:
                                 # Log but don't block login if email service is unavailable
                                 logger.warning(f"Failed to trigger email fetch on login: {e}", exc_info=True)
@@ -1089,10 +1095,59 @@ class AuthService:
                     logger.warning("⚠️  No messages to process")
                     return
                 
+                # Pre-check: Filter out emails that already exist to avoid duplicate processing
+                # This prevents unnecessary Gmail API calls and email service calls
+                emails_to_process = []
+                skipped_existing = 0
+                
+                # Import email ID generation logic (same as email service uses)
+                import hashlib
+                def generate_email_id(uid: int, gmail_id: str) -> str:
+                    """Generate deterministic email ID (same logic as email service)"""
+                    composite_key = f"{uid}:{gmail_id}"
+                    hash_obj = hashlib.sha256(composite_key.encode('utf-8'))
+                    return hash_obj.hexdigest()[:32]
+                
+                for msg in messages_to_process[:50]:
+                    msg_id = msg.get('id')
+                    if not msg_id:
+                        continue
+                    
+                    # Check if email already exists in vector DB before processing
+                    email_id = generate_email_id(user_id, msg_id)
+                    try:
+                        # Check vector DB directly using GET (HEAD not supported)
+                        # Vector DB service is typically on port 8004
+                        check_url = f"http://localhost:8004/api/vector/collections/emails/documents/{email_id}"
+                        check_response = await client.get(check_url, timeout=10.0)
+                        
+                        if check_response.status_code == 200:
+                            # Email already exists, skip it
+                            logger.debug(f"⏭️  Skipping email {msg_id} (ID: {email_id}) - already exists")
+                            skipped_existing += 1
+                            continue
+                    except httpx.HTTPStatusError as e:
+                        # 404 means email doesn't exist, which is fine - proceed
+                        if e.response.status_code == 404:
+                            pass  # Email doesn't exist, proceed with processing
+                        else:
+                            logger.debug(f"Error checking email {msg_id}: {e}, proceeding...")
+                    except Exception as e:
+                        # If check fails, proceed with processing (better to process than skip)
+                        logger.debug(f"Could not check if email {msg_id} exists: {e}, proceeding...")
+                    
+                    emails_to_process.append(msg)
+                
+                logger.info(f"📊 Pre-check complete: {len(emails_to_process)} new emails to process, {skipped_existing} already exist")
+                
+                if not emails_to_process:
+                    logger.info("✅ All emails already processed, nothing to do")
+                    return
+                
                 # Store new emails via email service (with auto-draft enabled)
                 processed_count = 0
-                # Process all messages (up to 50) - increased from 10 to check more emails
-                for msg in messages_to_process[:50]:
+                # Process only new emails
+                for msg in emails_to_process:
                     try:
                         msg_id = msg.get('id')
                         logger.info(f"📨 Processing message {msg_id}")
@@ -1207,7 +1262,7 @@ class AuthService:
                         )
                         # Continue processing other emails (don't fail entire webhook)
                 
-                logger.info(f"✅ Gmail notification processed: {processed_count}/{len(messages_to_process)} emails stored")
+                logger.info(f"✅ Gmail notification processed: {processed_count} new emails stored, {skipped_existing} already existed, {len(messages_to_process)} total checked")
                     
         except Exception as e:
             # Log top-level error with full context (no silent failure)

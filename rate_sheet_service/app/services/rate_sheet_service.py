@@ -339,6 +339,63 @@ class RateSheetService:
             List of top 3 re-ranked rate sheets with similarity scores
         """
         try:
+            # FAST PATH: If no query and no filters requiring semantic search, skip AI processing
+            # This significantly speeds up simple list requests
+            has_semantic_filters = origin_code or destination_code or container_type
+            if not query and not has_semantic_filters:
+                logger.info("Fast path: No query provided, skipping AI processing and returning all rate sheets")
+                # Get all rate sheets directly from vector DB (filtered by organization_id)
+                # Use a reasonable limit - most orgs won't have more than 1000 rate sheets
+                # Request exactly what we need to avoid unnecessary computation
+                vector_results = await self.embedding_service.search_rate_sheets(
+                    query="rate sheet",  # Generic query to get all results
+                    organization_id=organization_id,
+                    limit=min(limit, 1000),  # Cap at 1000 to avoid excessive computation
+                    filters={"carrier_name": carrier_name} if carrier_name else {}
+                )
+                
+                if not vector_results:
+                    return {
+                        "answer": "",
+                        "results": [],
+                        "total_found": 0,
+                        "total_returned": 0
+                    }
+                
+                # Format results without AI processing
+                formatted_results = []
+                for result in vector_results:
+                    metadata = result.get("metadata", {})
+                    document = result.get("document", "")
+                    
+                    # Apply carrier filter if provided
+                    if carrier_name and metadata.get("carrier_name", "").lower() != carrier_name.lower():
+                        continue
+                    
+                    formatted_results.append({
+                        "id": result.get("id"),
+                        "file_name": metadata.get("file_name", ""),
+                        "carrier_name": metadata.get("carrier_name", ""),
+                        "title": metadata.get("title", ""),
+                        "rate_sheet_type": metadata.get("rate_sheet_type", ""),
+                        "status": metadata.get("status", ""),
+                        "similarity": result.get("similarity", 0),
+                        "distance": result.get("distance", 1),
+                        "metadata": metadata,
+                        "document": document,
+                        "document_preview": document[:1000],
+                        "matching_data": {}
+                    })
+                
+                logger.info(f"Fast path: Returning {len(formatted_results)} rate sheets without AI processing")
+                return {
+                    "answer": "",  # No AI answer for simple list
+                    "results": formatted_results[:limit],  # Respect limit
+                    "total_found": len(formatted_results),
+                    "total_returned": min(len(formatted_results), limit)
+                }
+            
+            # SLOW PATH: Use AI processing when there's a query or semantic filters
             # Build search query
             search_query = query or "rate sheet"
             
@@ -358,7 +415,7 @@ class RateSheetService:
                 filters["carrier_name"] = carrier_name
             
             # Stage 1: Vector search - get top 20 results
-            logger.info(f"Stage 1: Vector search for query: '{query}'")
+            logger.info(f"Stage 1: Vector search for query: '{search_query}' (original: {query if query else 'None'})")
             vector_results = await self.embedding_service.search_rate_sheets(
                 query=search_query,
                 organization_id=organization_id,

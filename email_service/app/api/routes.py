@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Header, Query, Request
 from typing import Optional, List, Dict, Any
 from fastapi import Query
+import httpx
 from ..services.email_service import (
     store_email,
     get_new_emails,
@@ -10,6 +11,7 @@ from ..services.email_service import (
     mark_email_as_processed,
     search_emails_semantic,
 )
+from ..services.email_service import EMAILS_COLLECTION, _metadata_to_email
 from ..services.email_monitor_service import (
     fetch_and_store_emails,
 )
@@ -620,4 +622,229 @@ async def fetch_emails_endpoint(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to fetch emails: {str(e)}",
+        )
+
+
+async def verify_admin_access(token: str) -> bool:
+    """Verify if user has admin access"""
+    import httpx
+    try:
+        async with httpx.AsyncClient() as client:
+            auth_response = await client.get(
+                f"{settings.AUTH_SERVICE_URL}/api/auth/admin",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0
+            )
+            return auth_response.status_code == 200
+    except Exception as e:
+        logger.error(f"Error verifying admin access: {str(e)}")
+        return False
+
+
+@router.get("/admin/all")
+async def admin_list_all_emails(
+    authorization: str = Header(default=""),
+    limit: int = Query(default=1000, ge=1, le=10000),
+    offset: int = Query(default=0, ge=0),
+):
+    """
+    Admin endpoint: List ALL emails across ALL users (admin only)
+    
+    IMPORTANT: This endpoint bypasses user-level privacy for admin access.
+    Only users with is_staff=True or is_superuser=True can access this.
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=403,
+            detail="Authorization header missing or invalid",
+        )
+    
+    token = authorization.replace("Bearer ", "")
+    
+    # Verify admin access
+    if not await verify_admin_access(token):
+        raise HTTPException(
+            status_code=403,
+            detail="Admin access required. Only staff or superuser accounts can access this endpoint."
+        )
+    
+    try:
+        # Get all emails from vector DB (no user_id filter)
+        async with httpx.AsyncClient() as client:
+            # Use a generic query to get all emails
+            response = await client.post(
+                f"{settings.VECTOR_DB_SERVICE_URL}/api/vector/collections/{EMAILS_COLLECTION}/query",
+                json={
+                    "query_texts": ["email"],
+                    "n_results": limit + offset  # Get enough to paginate
+                },
+                timeout=60.0
+            )
+            
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to query vector DB"
+                )
+            
+            data = response.json()
+            results = data.get("results", {})
+            ids = results.get("ids", [[]])[0]
+            metadatas = results.get("metadatas", [[]])[0]
+            documents = results.get("documents", [[]])[0]
+            
+            # Convert to Email objects
+            all_emails = []
+            for i, meta in enumerate(metadatas):
+                email = _metadata_to_email(
+                    ids[i],
+                    meta,
+                    documents[i] if documents else ""
+                )
+                all_emails.append(email)
+            
+            # Sort by date (newest first)
+            all_emails.sort(key=lambda x: x.date or "", reverse=True)
+            
+            # Apply pagination
+            paginated_emails = all_emails[offset:offset + limit]
+            
+            # Build response
+            email_list = []
+            for email in paginated_emails:
+                email_data = {
+                    "id": email.id,
+                    "user_id": email.user_id,
+                    "gmail_message_id": email.gmail_message_id,
+                    "subject": email.subject,
+                    "from_email": email.from_email,
+                    "to_email": email.to_email,
+                    "snippet": email.snippet,
+                    "body_plain": email.body_plain[:500] if email.body_plain else None,  # Truncate for list view
+                    "body_html": email.body_html[:500] if email.body_html else None,  # Truncate for list view
+                    "date": email.date,
+                    "has_attachments": email.has_attachments,
+                    "attachment_count": email.attachment_count,
+                    "is_read": email.is_read,
+                    "is_processed": email.is_processed,
+                    "is_rate_sheet": email.is_rate_sheet,
+                    "created_at": email.created_at,
+                    "drafted_response": email.drafted_response,
+                }
+                email_list.append(email_data)
+            
+            return {
+                "emails": email_list,
+                "total": len(all_emails),
+                "limit": limit,
+                "offset": offset,
+                "returned": len(email_list)
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to list all emails (admin): {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to list all emails: {str(e)}",
+        )
+
+
+@router.get("/admin/stats")
+async def admin_email_stats(
+    authorization: str = Header(default="")
+):
+    """
+    Admin endpoint: Get email statistics across all users (admin only)
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=403,
+            detail="Authorization header missing or invalid",
+        )
+    
+    token = authorization.replace("Bearer ", "")
+    
+    # Verify admin access
+    if not await verify_admin_access(token):
+        raise HTTPException(
+            status_code=403,
+            detail="Admin access required. Only staff or superuser accounts can access this endpoint."
+        )
+    
+    try:
+        # Get collection info to get total count
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{settings.VECTOR_DB_SERVICE_URL}/api/vector/collections/{EMAILS_COLLECTION}",
+                timeout=10.0
+            )
+            
+            total_emails = 0
+            if response.status_code == 200:
+                collection_info = response.json()
+                total_emails = collection_info.get("count", 0)
+            
+            # Get sample of emails to calculate stats
+            sample_response = await client.post(
+                f"{settings.VECTOR_DB_SERVICE_URL}/api/vector/collections/{EMAILS_COLLECTION}/query",
+                json={
+                    "query_texts": ["email"],
+                    "n_results": min(1000, total_emails)  # Sample up to 1000
+                },
+                timeout=30.0
+            )
+            
+            unread_count = 0
+            processed_count = 0
+            with_drafts_count = 0
+            rate_sheet_count = 0
+            unique_users = set()
+            
+            if sample_response.status_code == 200:
+                sample_data = sample_response.json()
+                results = sample_data.get("results", {})
+                metadatas = results.get("metadatas", [[]])[0]
+                
+                for meta in metadatas:
+                    if not meta.get("is_read", False):
+                        unread_count += 1
+                    if meta.get("is_processed", False):
+                        processed_count += 1
+                    if meta.get("drafted_response"):
+                        with_drafts_count += 1
+                    if meta.get("is_rate_sheet", False):
+                        rate_sheet_count += 1
+                    user_id = meta.get("user_id")
+                    if user_id:
+                        unique_users.add(str(user_id))
+            
+            # Extrapolate stats if we sampled
+            if total_emails > 1000:
+                sample_size = len(metadatas) if sample_response.status_code == 200 else 0
+                if sample_size > 0:
+                    ratio = total_emails / sample_size
+                    unread_count = int(unread_count * ratio)
+                    processed_count = int(processed_count * ratio)
+                    with_drafts_count = int(with_drafts_count * ratio)
+                    rate_sheet_count = int(rate_sheet_count * ratio)
+            
+            return {
+                "total_emails": total_emails,
+                "unread_emails": unread_count,
+                "processed_emails": processed_count,
+                "emails_with_drafts": with_drafts_count,
+                "rate_sheet_emails": rate_sheet_count,
+                "unique_users": len(unique_users),
+                "read_emails": total_emails - unread_count if total_emails > 0 else 0
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get email stats (admin): {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get email stats: {str(e)}",
         )

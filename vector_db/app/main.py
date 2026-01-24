@@ -1,12 +1,24 @@
 from fastapi import FastAPI
 import sys
+import logging
 from pathlib import Path
 from .api.routes import router as vector_router
 
-# Try to import shared error handlers
+# Set up shared logging configuration with fallback
 SHARED_PATH = Path(__file__).parent.parent.parent.parent / "shared"
 if str(SHARED_PATH) not in sys.path:
     sys.path.insert(0, str(SHARED_PATH))
+
+# Try to import shared logging, fallback to basic logging
+try:
+    from logging_config import setup_service_logging, log_service_startup, log_service_ready
+    logger = setup_service_logging("vector-db", suppress_warnings=True)
+    USE_SHARED_LOGGING = True
+except ImportError:
+    # Fallback to basic logging
+    logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
+    logger = logging.getLogger("vector-db")
+    USE_SHARED_LOGGING = False
 
 try:
     from error_handlers import register_error_handlers
@@ -18,6 +30,15 @@ app = FastAPI(
     title="Vector DB Microservice",
     version="0.1.0",
 )
+
+@app.on_event("startup")
+async def startup_event():
+    if USE_SHARED_LOGGING:
+        log_service_startup(logger, "vector-db", 8004, "0.1.0")
+        log_service_ready(logger, "vector-db", "ChromaDB ready")
+    else:
+        logger.info("🚀 Vector DB Service v0.1.0 - Port 8004")
+        logger.info("✅ Vector DB Service Ready (ChromaDB ready)")
 
 # Register error handlers if available
 if ERROR_HANDLERS_AVAILABLE:

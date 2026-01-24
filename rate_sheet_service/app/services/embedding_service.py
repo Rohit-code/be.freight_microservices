@@ -301,11 +301,14 @@ class EmbeddingService:
                 # Query ChromaDB (currently doesn't support where filters, so we filter post-query)
                 # Note: Vector DB service currently uses post-query filtering
                 # Future enhancement: Add where filters directly to vector DB query for better performance
+                # Optimize: Request only what we need (limit) instead of limit * 3 to reduce computation
+                # Only request more if we have filters that might filter out results
+                n_results = limit * 3 if filters else limit
                 response = await client.post(
                     f"{self.vector_db_service_url}/api/vector/collections/{RATE_SHEETS_COLLECTION}/query",
                     json={
                         "query_texts": [query],
-                        "n_results": limit * 3  # Get more results to account for filtering
+                        "n_results": n_results
                     },
                     timeout=30.0
                 )

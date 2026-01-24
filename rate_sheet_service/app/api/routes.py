@@ -308,3 +308,190 @@ async def send_email_response(
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "service": "rate_sheet_service"}
+
+
+async def verify_admin_access(token: str) -> bool:
+    """Verify if user has admin access"""
+    import httpx
+    from app.core.config import settings
+    try:
+        async with httpx.AsyncClient() as client:
+            auth_response = await client.get(
+                f"{settings.AUTH_SERVICE_URL}/api/auth/admin",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0
+            )
+            return auth_response.status_code == 200
+    except Exception as e:
+        logger.error(f"Error verifying admin access: {str(e)}")
+        return False
+
+
+@router.get("/admin/all")
+async def admin_list_all_rate_sheets(
+    authorization: str = Header(default=""),
+    limit: int = Query(default=1000, ge=1, le=10000),
+    offset: int = Query(default=0, ge=0),
+):
+    """
+    Admin endpoint: List ALL rate sheets across ALL organizations (admin only)
+    
+    IMPORTANT: This endpoint bypasses organization-level isolation for admin access.
+    Only users with is_staff=True or is_superuser=True can access this.
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=403,
+            detail="Authorization header missing or invalid",
+        )
+    
+    token = authorization.replace("Bearer ", "")
+    
+    # Verify admin access
+    if not await verify_admin_access(token):
+        raise HTTPException(
+            status_code=403,
+            detail="Admin access required. Only staff or superuser accounts can access this endpoint."
+        )
+    
+    try:
+        import httpx
+        from app.core.config import settings
+        
+        # Query vector DB directly to get all rate sheets (bypass organization filter)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{settings.VECTOR_DB_SERVICE_URL}/api/vector/collections/rate_sheets/query",
+                json={
+                    "query_texts": ["rate sheet"],
+                    "n_results": limit + offset  # Get enough to paginate
+                },
+                timeout=60.0
+            )
+            
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to query vector DB"
+                )
+            
+            data = response.json()
+            results = data.get("results", {})
+            ids = results.get("ids", [[]])[0]
+            metadatas = results.get("metadatas", [[]])[0]
+            documents = results.get("documents", [[]])[0]
+            
+            # Build rate sheet list
+            all_rate_sheets = []
+            for i, meta in enumerate(metadatas):
+                rate_sheet_data = {
+                    "id": ids[i],
+                    "file_name": meta.get("file_name", ""),
+                    "carrier_name": meta.get("carrier_name", ""),
+                    "title": meta.get("title", ""),
+                    "rate_sheet_type": meta.get("rate_sheet_type", ""),
+                    "status": meta.get("status", ""),
+                    "organization_id": meta.get("organization_id"),
+                    "user_id": meta.get("user_id"),
+                    "uploaded_at": meta.get("uploaded_at"),
+                    "metadata": meta,
+                    "document_preview": documents[i][:500] if documents else "",  # Truncate for list view
+                }
+                all_rate_sheets.append(rate_sheet_data)
+            
+            # Sort by uploaded_at (newest first)
+            all_rate_sheets.sort(key=lambda x: x.get("uploaded_at") or "", reverse=True)
+            
+            # Apply pagination
+            paginated_sheets = all_rate_sheets[offset:offset + limit]
+            
+            return {
+                "rate_sheets": paginated_sheets,
+                "total": len(all_rate_sheets),
+                "limit": limit,
+                "offset": offset,
+                "returned": len(paginated_sheets)
+            }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to list all rate sheets (admin): {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to list all rate sheets: {str(e)}",
+        )
+
+
+@router.get("/admin/stats")
+async def admin_rate_sheet_stats(
+    authorization: str = Header(default="")
+):
+    """
+    Admin endpoint: Get rate sheet statistics across all organizations (admin only)
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=403,
+            detail="Authorization header missing or invalid",
+        )
+    
+    token = authorization.replace("Bearer ", "")
+    
+    # Verify admin access
+    if not await verify_admin_access(token):
+        raise HTTPException(
+            status_code=403,
+            detail="Admin access required. Only staff or superuser accounts can access this endpoint."
+        )
+    
+    try:
+        import httpx
+        from app.core.config import settings
+        
+        # Get collection info to get total count
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{settings.VECTOR_DB_SERVICE_URL}/api/vector/collections/rate_sheets",
+                timeout=10.0
+            )
+            
+            total_rate_sheets = 0
+            unique_organizations = set()
+            
+            if response.status_code == 200:
+                collection_info = response.json()
+                total_rate_sheets = collection_info.get("count", 0)
+                
+                # Get sample to calculate org stats
+                sample_response = await client.post(
+                    f"{settings.VECTOR_DB_SERVICE_URL}/api/vector/collections/rate_sheets/query",
+                    json={
+                        "query_texts": ["rate sheet"],
+                        "n_results": min(1000, total_rate_sheets)
+                    },
+                    timeout=30.0
+                )
+                
+                if sample_response.status_code == 200:
+                    sample_data = sample_response.json()
+                    results = sample_data.get("results", {})
+                    metadatas = results.get("metadatas", [[]])[0]
+                    
+                    for meta in metadatas:
+                        org_id = meta.get("organization_id")
+                        if org_id:
+                            unique_organizations.add(str(org_id))
+            
+            return {
+                "total_rate_sheets": total_rate_sheets,
+                "unique_organizations": len(unique_organizations),
+                "average_per_organization": total_rate_sheets / len(unique_organizations) if unique_organizations else 0
+            }
+            
+    except Exception as e:
+        logger.error(f"Failed to get rate sheet stats (admin): {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get rate sheet stats: {str(e)}",
+        )

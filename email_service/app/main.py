@@ -1,48 +1,68 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 import sys
+import logging
 from pathlib import Path
 from .api.routes import router as email_router
 from .services.email_service import ensure_collection_exists
-import logging
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# Try to import shared error handlers
+# Set up shared logging configuration with fallback
 SHARED_PATH = Path(__file__).parent.parent.parent.parent.parent / "shared"
 if str(SHARED_PATH) not in sys.path:
     sys.path.insert(0, str(SHARED_PATH))
 
+# Try to import shared logging, fallback to basic logging
+try:
+    from logging_config import setup_service_logging, log_service_startup, log_service_ready, log_dependency_status
+    logger = setup_service_logging("email", suppress_warnings=True)
+    USE_SHARED_LOGGING = True
+except ImportError:
+    # Fallback to basic logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
+    logger = logging.getLogger("email")
+    USE_SHARED_LOGGING = False
+
+# Try to import shared error handlers
 try:
     from error_handlers import register_error_handlers
     ERROR_HANDLERS_AVAILABLE = True
 except ImportError:
     ERROR_HANDLERS_AVAILABLE = False
-    logger.warning("Shared error handlers not available, using default FastAPI error handling")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events"""
     # Startup
-    logger.info("Email service starting up...")
+    if USE_SHARED_LOGGING:
+        log_service_startup(logger, "email", 8005, "0.3.0")
+    else:
+        logger.info("🚀 Email Service v0.3.0 - Port 8005")
     
     # Ensure vector DB collection exists
     await ensure_collection_exists()
-    logger.info("Vector DB collection ready")
+    if USE_SHARED_LOGGING:
+        log_dependency_status(logger, "Vector DB", "ok")
+    else:
+        logger.info("✅ Vector DB: ok")
     
-    # Note: No polling scheduler - using Gmail webhooks for instant notifications
-    logger.info("Email service ready (using Gmail webhooks for real-time updates)")
+    # Service ready
+    if USE_SHARED_LOGGING:
+        log_service_ready(logger, "email", "Gmail webhooks enabled")
+    else:
+        logger.info("✅ Email Service Ready (Gmail webhooks enabled)")
     
     yield
     
-    # Shutdown
-    logger.info("Email service shutting down...")
+    # Shutdown  
+    if USE_SHARED_LOGGING:
+        try:
+            from logging_config import log_service_shutdown
+            log_service_shutdown(logger, "email")
+        except ImportError:
+            logger.info("🛑 Email Service Shutting Down")
+    else:
+        logger.info("🛑 Email Service Shutting Down")
 
 
 app = FastAPI(
