@@ -34,6 +34,10 @@ def setup_service_logging(
         # Suppress bcrypt version warnings (common with Python 3.14)
         warnings.filterwarnings("ignore", ".*error reading bcrypt version.*")
         
+        # Suppress Python 3.14 multiprocessing warnings
+        warnings.filterwarnings("ignore", ".*resource_tracker.*leaked semaphore objects.*")
+        warnings.filterwarnings("ignore", ".*There appear to be.*leaked semaphore objects.*")
+        
         # Suppress other common warnings
         warnings.filterwarnings("ignore", ".*watchfiles.*")
         warnings.filterwarnings("ignore", ".*reloader.*")
@@ -58,6 +62,7 @@ def setup_service_logging(
         "watchfiles.main",
         "passlib.handlers.bcrypt",  # Suppress bcrypt version warnings
         "httpx",  # Reduce HTTP request logging noise
+        "multiprocessing.resource_tracker",  # Suppress Python 3.14 semaphore warnings
     ]
     
     for noisy_logger in noisy_loggers:
@@ -103,6 +108,8 @@ class QuietStartupFilter(logging.Filter):
         "Shared error handlers not available",
         "error reading bcrypt version",  # Suppress bcrypt warnings
         "HTTP Request:",  # Suppress HTTP request logs (can be re-enabled if needed)
+        "leaked semaphore objects",  # Suppress Python 3.14 multiprocessing warnings
+        "resource_tracker:",  # Suppress resource tracker warnings
     ]
     
     def filter(self, record):
