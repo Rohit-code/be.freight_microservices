@@ -1,4 +1,12 @@
-"""Rate Sheet Service - stores all data in ChromaDB with BGE embeddings + PostgreSQL for structured data"""
+"""
+Rate Sheet Service
+
+FLOW:
+1. Pandas Normalization (NO AI) - Convert Excel to clean grid
+2. AI Semantic Extraction - Map to structured schema
+3. Validation + Guardrails - Deterministic checks
+4. Storage - SQL + Graph + ChromaDB
+"""
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import os
@@ -6,9 +14,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
 import logging
 import numpy as np
+import hashlib
 
 from app.services.excel_parser import ExcelParser
-from app.services.ai_analyzer import AIAnalyzer
+from app.services.rate_sheet_extractor import RateSheetExtractor
+from app.services.rate_sheet_pipeline import RateSheetPipeline
 from app.services.embedding_service import EmbeddingService
 from app.services.rerank_service import RerankService
 from app.core.config import settings
@@ -96,11 +106,20 @@ def convert_numpy_types(obj: Any) -> Any:
 
 
 class RateSheetService:
-    """Main service for rate sheet operations - hybrid storage: ChromaDB (search) + PostgreSQL (structured data)"""
+    """
+    Main service for rate sheet operations
+    
+    FLOW:
+    1. Pandas Normalization (NO AI) - Convert Excel to clean grid
+    2. AI Semantic Extraction - Map to structured schema  
+    3. Validation + Guardrails - Deterministic checks
+    4. Storage - SQL + Graph + ChromaDB
+    """
     
     def __init__(self):
         self.excel_parser = ExcelParser()
-        self.ai_analyzer = AIAnalyzer()
+        self.extractor = RateSheetExtractor()  # Legacy extractor (backup)
+        self.pipeline = RateSheetPipeline(settings.AI_SERVICE_URL)  # NEW: Full pipeline
         self.embedding_service = EmbeddingService()
         self.rerank_service = RerankService()
         self.upload_dir = settings.UPLOAD_DIR
@@ -108,14 +127,17 @@ class RateSheetService:
         
         # Import here to avoid circular imports
         from app.services.structured_data_service import StructuredDataService
+        from app.services.graph_aware_ingestion import GraphAwareIngestion
         self.structured_data_service = StructuredDataService()
+        self.graph_aware_ingestion = GraphAwareIngestion()
     
     async def upload_rate_sheet(
         self,
         file_content: bytes,
         file_name: str,
         organization_id: int,
-        user_id: int
+        user_id: int,
+        async_mode: bool = False
     ) -> Dict[str, Any]:
         """
         Upload and process a rate sheet file - stores in ChromaDB with BGE embeddings
@@ -125,10 +147,93 @@ class RateSheetService:
             file_name: Original file name
             organization_id: Organization ID
             user_id: User ID who uploaded
+            async_mode: If True, returns immediately and processes in background
         
         Returns:
             Dictionary with rate sheet data (stored in ChromaDB)
         """
+        # Calculate file hash for idempotency check
+        file_hash = hashlib.sha256(file_content).hexdigest()
+        idempotency_key = f"{organization_id}:{file_hash}"
+        
+        # Check for existing upload with same file content (idempotency)
+        existing = await self._check_duplicate(organization_id, file_hash)
+        if existing:
+            if existing.status == 'processed':
+                # File already processed - check if ChromaDB is in sync
+                logger.info(f"🔄 Duplicate detected: {existing.rate_sheet_id} (status={existing.status})")
+                
+                # Check if document exists in ChromaDB - if not, sync it
+                chromadb_doc = await self.embedding_service.get_rate_sheet_by_id(existing.rate_sheet_id)
+                if not chromadb_doc:
+                    logger.warning(f"⚠️ Rate sheet {existing.rate_sheet_id} missing from ChromaDB - syncing now")
+                    # Sync to ChromaDB using existing JSONB columns from PostgreSQL
+                    try:
+                        # Build structured_data from JSONB columns
+                        structured_data = {
+                            "routes": existing.routes_json or [],
+                            "pricing_tiers": existing.pricing_tiers_json or [],
+                            "surcharges": existing.surcharges_json or [],
+                            "additional_charges": existing.additional_charges or [],
+                            "carrier_name": existing.carrier_name or "",
+                            "rate_sheet_type": existing.rate_sheet_type or "ocean_freight",
+                            "title": existing.title or "",
+                            "validity": {
+                                "valid_from": existing.valid_from.isoformat() if existing.valid_from else None,
+                                "valid_to": existing.valid_to.isoformat() if existing.valid_to else None,
+                                "effective_date": existing.effective_date.isoformat() if existing.effective_date else None
+                            },
+                            "relationships": {
+                                "is_related": existing.is_related == "true",
+                                "relationship_type": existing.relationship_type or "",
+                                "related_to_rate_sheets": existing.related_rate_sheet_ids or []
+                            }
+                        }
+                        now = datetime.utcnow()
+                        metadata = {
+                            "organization_id": organization_id,
+                            "user_id": existing.user_id,
+                            "file_name": existing.file_name,
+                            "file_path": existing.file_path or "",
+                            "file_size_bytes": len(file_content),
+                            "file_type": os.path.splitext(existing.file_name)[1].lower() if existing.file_name else "",
+                            "status": "processed",
+                            "created_at": existing.created_at.isoformat() if existing.created_at else now.isoformat(),
+                            "updated_at": now.isoformat(),
+                            "processed_at": now.isoformat(),
+                        }
+                        await self.embedding_service.store_rate_sheet(
+                            rate_sheet_id=existing.rate_sheet_id,
+                            rate_sheet_data=structured_data,
+                            parsed_data={},  # Don't have parsed_data, but that's okay
+                            metadata=metadata
+                        )
+                        logger.info(f"✅ Synced rate sheet {existing.rate_sheet_id} to ChromaDB")
+                    except Exception as sync_error:
+                        logger.error(f"❌ Failed to sync to ChromaDB: {sync_error}")
+                
+                return {
+                    "id": existing.rate_sheet_id,
+                    "status": existing.status,
+                    "reused": True,
+                    "message": "Identical file already uploaded and processed",
+                    "existing_version": existing.version,
+                    "file_name": existing.file_name,
+                    "carrier_name": existing.carrier_name,
+                    "created_at": existing.created_at.isoformat() if existing.created_at else None
+                }
+            else:
+                # File still pending/processing - reuse existing job
+                logger.info(f"♻️  Reusing existing job: {existing.rate_sheet_id} (status={existing.status})")
+                return {
+                    "id": existing.rate_sheet_id,
+                    "status": existing.status,
+                    "reused": True,
+                    "message": f"Identical file already uploaded (status: {existing.status})",
+                    "file_name": existing.file_name,
+                    "created_at": existing.created_at.isoformat() if existing.created_at else None
+                }
+        
         # Save file
         file_path = await self._save_file(file_content, file_name, organization_id)
         file_size = len(file_content)
@@ -136,23 +241,268 @@ class RateSheetService:
         
         # Generate unique ID
         rate_sheet_id = str(uuid.uuid4())
-        now = datetime.utcnow().isoformat()
+        now = datetime.utcnow()
+        
+        if async_mode:
+            # ASYNC MODE: Create pending record and return immediately
+            return await self._create_pending_record(
+                rate_sheet_id=rate_sheet_id,
+                organization_id=organization_id,
+                user_id=user_id,
+                file_name=file_name,
+                file_path=file_path,
+                file_size=file_size,
+                file_ext=file_ext,
+                file_hash=file_hash,
+                idempotency_key=idempotency_key
+            )
+        
+        # SYNC MODE: Process immediately (legacy behavior)
+        return await self._process_rate_sheet_sync(
+            rate_sheet_id=rate_sheet_id,
+            organization_id=organization_id,
+            user_id=user_id,
+            file_name=file_name,
+            file_path=file_path,
+            file_size=file_size,
+            file_ext=file_ext,
+            now=now,
+            file_hash=file_hash,
+            idempotency_key=idempotency_key
+        )
+    
+    async def _check_duplicate(self, organization_id: int, file_hash: str):
+        """
+        Check if a file with the same hash already exists for this organization.
+        Returns the existing record if found, None otherwise.
+        """
+        from app.core.database import AsyncSessionLocal
+        from app.models.structured_data import RateSheetStructuredData
+        from sqlalchemy import select, and_
         
         try:
-            # Parse Excel file
-            parsed_data = self.excel_parser.parse_file(file_path)
-            
-            # Get existing rate sheets for relationship detection
-            existing_rate_sheets = await self._get_recent_rate_sheets(organization_id, limit=10)
-            
-            # AI Analysis
-            ai_analysis = await self.ai_analyzer.analyze_rate_sheet(
-                parsed_data=parsed_data,
-                file_name=file_name,
-                existing_rate_sheets=existing_rate_sheets
+            async with AsyncSessionLocal() as db_session:
+                result = await db_session.execute(
+                    select(RateSheetStructuredData).where(
+                        and_(
+                            RateSheetStructuredData.organization_id == organization_id,
+                            RateSheetStructuredData.file_hash == file_hash
+                        )
+                    ).order_by(RateSheetStructuredData.created_at.desc())
+                )
+                return result.scalar_one_or_none()
+        except Exception as e:
+            logger.warning(f"Error checking for duplicate: {e}")
+            return None
+    
+    async def _create_pending_record(
+        self,
+        rate_sheet_id: str,
+        organization_id: int,
+        user_id: int,
+        file_name: str,
+        file_path: str,
+        file_size: int,
+        file_ext: str,
+        file_hash: str = None,
+        idempotency_key: str = None
+    ) -> Dict[str, Any]:
+        """
+        Phase 1 (Fast): Create a pending record in PostgreSQL and return immediately.
+        Background task will process the file later.
+        """
+        from app.core.database import AsyncSessionLocal
+        from app.models.structured_data import RateSheetStructuredData
+        
+        now = datetime.utcnow()
+        
+        try:
+            async with AsyncSessionLocal() as db_session:
+                # Check for existing rate sheet with same carrier/validity to determine version
+                version = 1
+                supersedes_id = None
+                
+                # Create pending record
+                pending_record = RateSheetStructuredData(
+                    rate_sheet_id=rate_sheet_id,
+                    organization_id=organization_id,
+                    user_id=user_id,
+                    file_name=file_name,
+                    file_path=file_path,
+                    file_hash=file_hash,
+                    idempotency_key=idempotency_key,
+                    status='pending',
+                    version=version,
+                    supersedes_rate_sheet_id=supersedes_id,
+                    is_active=True,
+                    routes=[],  # Will be populated during processing
+                    created_at=now,
+                    updated_at=now
+                )
+                
+                db_session.add(pending_record)
+                await db_session.commit()
+                
+                logger.info(f"📋 Created pending rate sheet record: {rate_sheet_id}")
+                
+                return {
+                    "id": rate_sheet_id,
+                    "status": "pending",
+                    "message": "Rate sheet uploaded. Processing in background.",
+                    "organization_id": organization_id,
+                    "file_name": file_name,
+                    "file_size_bytes": file_size,
+                    "file_type": file_ext,
+                    "created_at": now.isoformat(),
+                    "version": version
+                }
+                
+        except Exception as e:
+            logger.error(f"Error creating pending record: {e}")
+            raise
+    
+    async def process_rate_sheet_background(self, rate_sheet_id: str) -> Dict[str, Any]:
+        """
+        Phase 2 (Background): Process a pending rate sheet.
+        Called by background task after upload returns.
+        """
+        from app.core.database import AsyncSessionLocal
+        from app.models.structured_data import RateSheetStructuredData
+        from sqlalchemy import select
+        
+        async with AsyncSessionLocal() as db_session:
+            # Get the pending record
+            result = await db_session.execute(
+                select(RateSheetStructuredData).where(
+                    RateSheetStructuredData.rate_sheet_id == rate_sheet_id
+                )
             )
+            record = result.scalar_one_or_none()
             
-            # Prepare metadata for ChromaDB storage
+            if not record:
+                raise ValueError(f"Rate sheet {rate_sheet_id} not found")
+            
+            if record.status != 'pending':
+                logger.warning(f"Rate sheet {rate_sheet_id} is not pending (status={record.status})")
+                return {"id": rate_sheet_id, "status": record.status}
+            
+            # Update status to processing
+            record.status = 'processing'
+            record.processing_started_at = datetime.utcnow()
+            await db_session.commit()
+            
+            logger.info(f"🔄 Processing rate sheet: {rate_sheet_id}")
+            
+            try:
+                # Process the rate sheet
+                result = await self._process_rate_sheet_sync(
+                    rate_sheet_id=rate_sheet_id,
+                    organization_id=record.organization_id,
+                    user_id=record.user_id,
+                    file_name=record.file_name,
+                    file_path=record.file_path,
+                    file_size=0,  # Not needed for processing
+                    file_ext=os.path.splitext(record.file_name)[1].lower(),
+                    now=datetime.utcnow(),
+                    update_existing=True  # Update existing record instead of creating new
+                )
+                
+                # Update status to processed
+                record.status = 'processed'
+                record.processing_completed_at = datetime.utcnow()
+                record.processing_error = None
+                await db_session.commit()
+                
+                logger.info(f"✅ Rate sheet processed: {rate_sheet_id}")
+                return result
+                
+            except Exception as e:
+                # Update status to failed
+                record.status = 'failed'
+                record.processing_error = str(e)
+                record.processing_completed_at = datetime.utcnow()
+                await db_session.commit()
+                
+                logger.error(f"❌ Rate sheet processing failed: {rate_sheet_id} - {e}")
+                raise
+    
+    async def get_rate_sheet_status(self, rate_sheet_id: str, organization_id: int) -> Dict[str, Any]:
+        """Get the processing status of a rate sheet"""
+        from app.core.database import AsyncSessionLocal
+        from app.models.structured_data import RateSheetStructuredData
+        from sqlalchemy import select, and_
+        
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(
+                select(RateSheetStructuredData).where(
+                    and_(
+                        RateSheetStructuredData.rate_sheet_id == rate_sheet_id,
+                        RateSheetStructuredData.organization_id == organization_id
+                    )
+                )
+            )
+            record = result.scalar_one_or_none()
+            
+            if not record:
+                return None
+            
+            return {
+                "id": record.rate_sheet_id,
+                "status": record.status,
+                "file_name": record.file_name,
+                "carrier_name": record.carrier_name,
+                "version": record.version,
+                "is_active": record.is_active,
+                "processing_error": record.processing_error,
+                "processing_started_at": record.processing_started_at.isoformat() if record.processing_started_at else None,
+                "processing_completed_at": record.processing_completed_at.isoformat() if record.processing_completed_at else None,
+                "created_at": record.created_at.isoformat() if record.created_at else None
+            }
+    
+    async def _process_rate_sheet_sync(
+        self,
+        rate_sheet_id: str,
+        organization_id: int,
+        user_id: int,
+        file_name: str,
+        file_path: str,
+        file_size: int,
+        file_ext: str,
+        now: datetime,
+        update_existing: bool = False,
+        file_hash: str = None,
+        idempotency_key: str = None
+    ) -> Dict[str, Any]:
+        """
+        Process rate sheet through the full pipeline:
+        
+        1. PANDAS NORMALIZATION (NO AI) - Convert Excel to clean grid
+        2. AI SEMANTIC EXTRACTION - Map to structured schema
+        3. VALIDATION + GUARDRAILS - Deterministic checks
+        4. STORAGE - SQL + Graph + ChromaDB
+        """
+        try:
+            logger.info(f"🚀 [PIPELINE] Starting processing for: {file_name}")
+            
+            # =================================================================
+            # STAGE 1-3: PANDAS → AI → VALIDATION (via Pipeline)
+            # =================================================================
+            extracted_data, full_text, is_valid, issues = await self.pipeline.process(file_path)
+            
+            # Log validation results
+            if not is_valid:
+                logger.warning(f"⚠️ [PIPELINE] Validation issues: {issues}")
+            else:
+                logger.info(f"✅ [PIPELINE] Validation passed")
+            
+            # Get full text for ChromaDB (if not in extracted_data)
+            chromadb_text = extracted_data.pop("_full_text_for_chromadb", full_text)
+            
+            # =================================================================
+            # STAGE 4: STORAGE
+            # =================================================================
+            
+            # Prepare metadata
             metadata = {
                 "organization_id": organization_id,
                 "user_id": user_id,
@@ -160,55 +510,90 @@ class RateSheetService:
                 "file_path": file_path,
                 "file_size_bytes": file_size,
                 "file_type": file_ext,
-                "status": "processed",
-                "created_at": now,
-                "updated_at": now,
-                "processed_at": now,
+                "status": "processed" if is_valid else "processed_with_warnings",
+                "validation_passed": is_valid,
+                "validation_issues": issues if issues else [],
+                "created_at": now.isoformat(),
+                "updated_at": now.isoformat(),
+                "processed_at": now.isoformat(),
             }
             
-            # Store in ChromaDB with BGE embeddings (same pattern as email service)
-            await self.embedding_service.store_rate_sheet(
-                rate_sheet_id=rate_sheet_id,
-                rate_sheet_data=ai_analysis,
-                parsed_data=parsed_data,
-                metadata=metadata
-            )
+            # 4A: Store in ChromaDB (full text for semantic search)
+            try:
+                # Add full text to extracted data for ChromaDB storage
+                extracted_data_for_chromadb = extracted_data.copy()
+                extracted_data_for_chromadb["_full_sheet_text"] = chromadb_text
+                
+                # Parse legacy format for backward compatibility
+                parsed_data = self.excel_parser.parse_file(file_path)
+                
+                await self.embedding_service.store_rate_sheet(
+                    rate_sheet_id=rate_sheet_id,
+                    rate_sheet_data=extracted_data_for_chromadb,
+                    parsed_data=parsed_data,
+                    metadata=metadata
+                )
+                logger.info(f"✅ [STAGE 4A] Stored in ChromaDB for rate sheet {rate_sheet_id}")
+            except Exception as chromadb_error:
+                logger.error(f"❌ [STAGE 4A] ChromaDB storage failed: {chromadb_error}")
+                raise
             
-            # NEW: Store structured data in PostgreSQL for precise querying
-            # This enables exact rate extraction without text parsing
+            # 4B: Store structured data in PostgreSQL
             try:
                 from app.core.database import AsyncSessionLocal
                 async with AsyncSessionLocal() as db_session:
-                    await self.structured_data_service.store_structured_data(
-                        session=db_session,
-                        rate_sheet_id=rate_sheet_id,
-                        organization_id=organization_id,
-                        user_id=user_id,
-                        file_name=file_name,
-                        structured_data=ai_analysis
-                    )
-                    logger.info(f"✅ Stored structured data in PostgreSQL for rate sheet {rate_sheet_id}")
-            except Exception as structured_error:
-                # Log error but don't fail the upload - ChromaDB storage succeeded
-                logger.error(f"⚠️  Failed to store structured data (non-critical): {structured_error}")
+                    if update_existing:
+                        await self.structured_data_service.update_structured_data(
+                            session=db_session,
+                            rate_sheet_id=rate_sheet_id,
+                            structured_data=extracted_data
+                        )
+                    else:
+                        await self.structured_data_service.store_structured_data(
+                            session=db_session,
+                            rate_sheet_id=rate_sheet_id,
+                            organization_id=organization_id,
+                            user_id=user_id,
+                            file_name=file_name,
+                            structured_data=extracted_data,
+                            file_hash=file_hash,
+                            idempotency_key=idempotency_key
+                        )
+                    logger.info(f"✅ [STAGE 4B] Stored in PostgreSQL for rate sheet {rate_sheet_id}")
+            except Exception as sql_error:
+                logger.error(f"⚠️ [STAGE 4B] PostgreSQL storage failed (non-critical): {sql_error}")
             
-            # Convert numpy types to native Python types for JSON serialization
-            # Convert ai_analysis and parsed_data to ensure no numpy types
-            converted_ai_analysis = convert_numpy_types(ai_analysis)
-            converted_parsed_data = convert_numpy_types(parsed_data)
+            # 4C: Store graph relationships in ArangoDB
+            try:
+                await self.graph_aware_ingestion.ingest_rate_sheet(
+                    rate_sheet_id=rate_sheet_id,
+                    organization_id=organization_id,
+                    structured_data=extracted_data,
+                    raw_content=chromadb_text
+                )
+                logger.info(f"✅ [STAGE 4C] Stored in ArangoDB for rate sheet {rate_sheet_id}")
+            except Exception as graph_error:
+                logger.warning(f"⚠️ [STAGE 4C] ArangoDB storage failed (non-critical): {graph_error}")
+            
+            # Convert numpy types for JSON serialization
+            converted_extracted_data = convert_numpy_types(extracted_data)
             
             response_data = {
                 "id": rate_sheet_id,
                 **metadata,
-                **converted_ai_analysis,
-                "parsed_data": converted_parsed_data  # Include parsed data for reference
+                **converted_extracted_data,
+                "routes_count": len(extracted_data.get("routes", [])),
+                "validation_passed": is_valid
             }
             
-            # Final conversion to ensure all values are JSON serializable
+            logger.info(f"🏁 [PIPELINE] Processing complete for {file_name}: {len(extracted_data.get('routes', []))} routes")
+            
             return convert_numpy_types(response_data)
         
         except Exception as e:
-            logger.error(f"Error processing rate sheet {rate_sheet_id}: {e}")
+            import traceback
+            error_details = str(e) if str(e) else repr(e)
+            logger.error(f"Error processing rate sheet {rate_sheet_id}: {error_details}", exc_info=True)
             # Store failed status in ChromaDB
             try:
                 failed_metadata = {
@@ -219,20 +604,21 @@ class RateSheetService:
                     "file_size_bytes": file_size,
                     "file_type": file_ext,
                     "status": "failed",
-                    "processing_error": str(e),
-                    "created_at": now,
-                    "updated_at": now,
+                    "processing_error": error_details,
+                    "created_at": now.isoformat(),
+                    "updated_at": now.isoformat(),
                 }
                 await self.embedding_service.store_rate_sheet(
                     rate_sheet_id=rate_sheet_id,
-                    rate_sheet_data={"error": str(e)},
+                    rate_sheet_data={"error": error_details},
                     parsed_data={},
                     metadata=failed_metadata
                 )
             except Exception as store_error:
-                logger.error(f"Error storing failed rate sheet: {store_error}")
+                store_error_details = str(store_error) if str(store_error) else repr(store_error)
+                logger.error(f"Error storing failed rate sheet: {store_error_details}", exc_info=True)
             
-            raise
+            raise Exception(f"Failed to process rate sheet {rate_sheet_id}: {error_details}") from e
     
     async def _save_file(self, file_content: bytes, file_name: str, organization_id: int) -> str:
         """Save uploaded file to disk"""
@@ -681,3 +1067,295 @@ class RateSheetService:
         except Exception as e:
             logger.error(f"Error deleting rate sheet: {e}")
             return False
+    
+    async def reprocess_rate_sheet(
+        self,
+        rate_sheet_id: str,
+        organization_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Reprocess a rate sheet that failed AI extraction.
+        
+        This will:
+        1. Get the rate sheet record from PostgreSQL
+        2. Re-read the stored file (if available) or use stored raw content
+        3. Re-parse the Excel data
+        4. Re-run AI extraction with the fixed endpoint
+        5. Update the structured data in PostgreSQL
+        6. Update the graph data in ArangoDB
+        
+        Returns:
+            Updated rate sheet data or None if not found
+        """
+        from app.core.database import AsyncSessionLocal
+        from app.models import RateSheetStructuredData
+        from sqlalchemy import select
+        
+        logger.info(f"🔄 Reprocessing rate sheet {rate_sheet_id} for org {organization_id}")
+        
+        try:
+            # Step 1: Get the rate sheet record
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(RateSheetStructuredData).where(
+                        RateSheetStructuredData.rate_sheet_id == rate_sheet_id,
+                        RateSheetStructuredData.organization_id == organization_id
+                    )
+                )
+                record = result.scalar_one_or_none()
+                
+                if not record:
+                    logger.warning(f"Rate sheet {rate_sheet_id} not found for org {organization_id}")
+                    return None
+                
+                file_name = record.file_name
+                file_path = record.file_path
+                user_id = record.user_id
+            
+            # Step 2: Read the file content
+            file_content = None
+            
+            # Try to read from stored file path
+            if file_path and os.path.exists(file_path):
+                logger.info(f"📁 Reading file from: {file_path}")
+                with open(file_path, 'rb') as f:
+                    file_content = f.read()
+            else:
+                # Try to construct path from upload_dir
+                expected_path = os.path.join(self.upload_dir, str(organization_id), file_name)
+                if os.path.exists(expected_path):
+                    logger.info(f"📁 Reading file from: {expected_path}")
+                    with open(expected_path, 'rb') as f:
+                        file_content = f.read()
+                else:
+                    # Search in upload directory
+                    for root, dirs, files in os.walk(self.upload_dir):
+                        for f in files:
+                            if f == file_name or rate_sheet_id in f:
+                                full_path = os.path.join(root, f)
+                                logger.info(f"📁 Found file at: {full_path}")
+                                with open(full_path, 'rb') as file:
+                                    file_content = file.read()
+                                break
+                        if file_content:
+                            break
+            
+            if not file_content:
+                logger.error(f"❌ Could not find file for rate sheet {rate_sheet_id}")
+                # Update status to failed
+                async with AsyncSessionLocal() as session:
+                    result = await session.execute(
+                        select(RateSheetStructuredData).where(
+                            RateSheetStructuredData.rate_sheet_id == rate_sheet_id
+                        )
+                    )
+                    record = result.scalar_one_or_none()
+                    if record:
+                        record.status = 'failed'
+                        record.processing_error = 'File not found for reprocessing'
+                        await session.commit()
+                return {
+                    "id": rate_sheet_id,
+                    "status": "failed",
+                    "error": "File not found for reprocessing. Please re-upload the file."
+                }
+            
+            # Step 3: Parse the Excel file - need to save to temp file first
+            import tempfile
+            logger.info(f"📊 Parsing Excel file: {file_name}")
+            
+            # Save content to temp file for parsing
+            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1]) as tmp:
+                tmp.write(file_content)
+                tmp_path = tmp.name
+            
+            try:
+                parsed_data = self.excel_parser.parse_file(tmp_path)
+                parsed_data = convert_numpy_types(parsed_data)
+            finally:
+                # Clean up temp file
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            
+            # Step 4: Run AI extraction (with fixed endpoint)
+            logger.info(f"🤖 Running AI extraction for: {file_name}")
+            extracted_data = await self.extractor.extract_structured_data(
+                parsed_data=parsed_data,
+                file_name=file_name,
+                existing_rate_sheets=None
+            )
+            extracted_data = convert_numpy_types(extracted_data)
+            
+            routes_count = len(extracted_data.get('routes', []))
+            logger.info(f"✅ AI extraction complete: {routes_count} routes extracted")
+            
+            # Step 5: Update structured data in PostgreSQL
+            async with AsyncSessionLocal() as session:
+                updated_record = await self.structured_data_service.update_structured_data(
+                    session=session,
+                    rate_sheet_id=rate_sheet_id,
+                    structured_data=extracted_data
+                )
+                logger.info(f"✅ Updated PostgreSQL record for {rate_sheet_id}")
+            
+            # Step 6: Update graph data in ArangoDB
+            try:
+                await self.graph_aware_ingestion.ingest_rate_sheet(
+                    rate_sheet_id=rate_sheet_id,
+                    organization_id=organization_id,
+                    structured_data=extracted_data
+                )
+                logger.info(f"✅ Updated ArangoDB graph for {rate_sheet_id}")
+            except Exception as e:
+                logger.warning(f"⚠️ Graph update failed (non-critical): {e}")
+            
+            # Step 7: Store/Update in ChromaDB (always do this to ensure sync)
+            try:
+                now = datetime.utcnow()
+                metadata = {
+                    "organization_id": organization_id,
+                    "user_id": user_id,
+                    "file_name": file_name,
+                    "file_path": file_path,
+                    "file_size_bytes": len(file_content) if file_content else 0,
+                    "file_type": os.path.splitext(file_name)[1].lower(),
+                    "status": "processed",
+                    "created_at": now.isoformat(),
+                    "updated_at": now.isoformat(),
+                    "processed_at": now.isoformat(),
+                }
+                await self.embedding_service.store_rate_sheet(
+                    rate_sheet_id=rate_sheet_id,
+                    rate_sheet_data=extracted_data,
+                    parsed_data=parsed_data,
+                    metadata=metadata
+                )
+                logger.info(f"✅ Stored/Updated ChromaDB embeddings for {rate_sheet_id}")
+            except Exception as e:
+                logger.warning(f"⚠️ ChromaDB storage failed (non-critical): {e}")
+            
+            return {
+                "id": rate_sheet_id,
+                "status": "processed",
+                "file_name": file_name,
+                "carrier_name": extracted_data.get("carrier_name"),
+                "routes_count": routes_count,
+                "message": f"Successfully reprocessed with {routes_count} routes extracted"
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Error reprocessing rate sheet {rate_sheet_id}: {e}", exc_info=True)
+            
+            # Update status to failed
+            try:
+                async with AsyncSessionLocal() as session:
+                    result = await session.execute(
+                        select(RateSheetStructuredData).where(
+                            RateSheetStructuredData.rate_sheet_id == rate_sheet_id
+                        )
+                    )
+                    record = result.scalar_one_or_none()
+                    if record:
+                        record.status = 'failed'
+                        record.processing_error = str(e)[:500]
+                        await session.commit()
+            except Exception:
+                pass
+            
+            return {
+                "id": rate_sheet_id,
+                "status": "failed",
+                "error": str(e)
+            }
+    
+    async def reprocess_all_rate_sheets(
+        self,
+        organization_id: int
+    ) -> Dict[str, Any]:
+        """
+        Reprocess all rate sheets for an organization.
+        
+        This will:
+        1. Get all rate sheets from PostgreSQL
+        2. Re-run AI extraction on each file
+        3. Update the normalized tables
+        
+        Returns:
+            Summary of reprocessing results
+        """
+        from app.core.database import AsyncSessionLocal
+        from app.models import RateSheetStructuredData
+        from sqlalchemy import select
+        
+        logger.info(f"🔄 Reprocessing ALL rate sheets for org {organization_id}")
+        
+        results = {
+            "total": 0,
+            "success": 0,
+            "failed": 0,
+            "skipped": 0,
+            "details": []
+        }
+        
+        try:
+            # Get all rate sheets for this organization
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(RateSheetStructuredData).where(
+                        RateSheetStructuredData.organization_id == organization_id
+                    )
+                )
+                rate_sheets = result.scalars().all()
+                results["total"] = len(rate_sheets)
+            
+            logger.info(f"📋 Found {len(rate_sheets)} rate sheets to reprocess")
+            
+            # Reprocess each one
+            for rs in rate_sheets:
+                try:
+                    reprocess_result = await self.reprocess_rate_sheet(
+                        rate_sheet_id=rs.rate_sheet_id,
+                        organization_id=organization_id
+                    )
+                    
+                    if reprocess_result and reprocess_result.get("status") == "processed":
+                        results["success"] += 1
+                        results["details"].append({
+                            "rate_sheet_id": rs.rate_sheet_id,
+                            "file_name": rs.file_name,
+                            "status": "success",
+                            "routes_count": reprocess_result.get("routes_count", 0)
+                        })
+                    elif reprocess_result and "File not found" in reprocess_result.get("error", ""):
+                        results["skipped"] += 1
+                        results["details"].append({
+                            "rate_sheet_id": rs.rate_sheet_id,
+                            "file_name": rs.file_name,
+                            "status": "skipped",
+                            "reason": "File not found"
+                        })
+                    else:
+                        results["failed"] += 1
+                        results["details"].append({
+                            "rate_sheet_id": rs.rate_sheet_id,
+                            "file_name": rs.file_name,
+                            "status": "failed",
+                            "error": reprocess_result.get("error", "Unknown error") if reprocess_result else "No result"
+                        })
+                        
+                except Exception as e:
+                    results["failed"] += 1
+                    results["details"].append({
+                        "rate_sheet_id": rs.rate_sheet_id,
+                        "file_name": rs.file_name,
+                        "status": "failed",
+                        "error": str(e)
+                    })
+            
+            logger.info(f"✅ Reprocessing complete: {results['success']} success, {results['failed']} failed, {results['skipped']} skipped")
+            return results
+            
+        except Exception as e:
+            logger.error(f"❌ Error reprocessing all rate sheets: {e}", exc_info=True)
+            results["error"] = str(e)
+            return results

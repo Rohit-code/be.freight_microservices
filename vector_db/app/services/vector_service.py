@@ -11,10 +11,20 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Storage paths
-MICROSERVICES_ROOT = Path(__file__).parent.parent.parent.parent
-VECTOR_DB_PATH = MICROSERVICES_ROOT / settings.chroma_db_path
-VECTOR_DB_PATH.mkdir(parents=True, exist_ok=True)
+# Storage paths - handle both absolute and relative paths
+chroma_path = settings.chroma_db_path
+if os.path.isabs(chroma_path):
+    # Absolute path (from environment variable in Docker)
+    VECTOR_DB_PATH = Path(chroma_path)
+else:
+    # Relative path (for local development)
+    MICROSERVICES_ROOT = Path(__file__).parent.parent.parent.parent
+    VECTOR_DB_PATH = MICROSERVICES_ROOT / chroma_path
+
+# Ensure directory exists with proper permissions
+VECTOR_DB_PATH.mkdir(parents=True, exist_ok=True, mode=0o755)
+# Ensure write permissions for the directory
+os.chmod(VECTOR_DB_PATH, 0o755)
 
 # Global embedding model (lazy loaded)
 _embedding_model = None

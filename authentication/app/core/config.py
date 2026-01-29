@@ -88,6 +88,12 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("USER_SERVICE_URL", "user_service_url")
     )
     
+    # Email service URL (for storing emails)
+    EMAIL_SERVICE_URL: str = Field(
+        default="http://localhost:8005",
+        validation_alias=AliasChoices("EMAIL_SERVICE_URL", "email_service_url")
+    )
+    
     class Config:
         env_file = str(ENV_FILE) if ENV_FILE.exists() else None
         env_file_encoding = "utf-8"

@@ -1,3 +1,6 @@
+"""
+Configuration for Rate Sheet Service (Updated with Graph Support)
+"""
 from pydantic_settings import BaseSettings
 from pydantic import ConfigDict, Field, AliasChoices
 from typing import Optional
@@ -50,6 +53,15 @@ class Settings(BaseSettings):
     # Vector DB Service Configuration
     VECTOR_DB_SERVICE_URL: str = "http://localhost:8004"
     
+    # Knowledge Graph Service Configuration (NEW)
+    KNOWLEDGE_GRAPH_SERVICE_URL: str = "http://localhost:8011"
+    
+    # Orchestrator Service Configuration (NEW)
+    ORCHESTRATOR_SERVICE_URL: str = "http://localhost:8013"
+    
+    # Decision Engine Configuration (NEW)
+    DECISION_ENGINE_SERVICE_URL: str = "http://localhost:8014"
+    
     # Authentication Service Configuration (for sending emails)
     AUTH_SERVICE_URL: str = "http://localhost:8001"
     
@@ -67,9 +79,9 @@ class Settings(BaseSettings):
     MAX_CONCURRENT_UPLOADS: int = 5
     
     model_config = ConfigDict(
-        env_file=[".env", "../.env", "../../.env"],  # Check current dir, parent dir, and microservices root
+        env_file=[".env", "../.env", "../../.env"],
         case_sensitive=True,
-        extra="ignore"  # Ignore extra fields from .env file (other services' config)
+        extra="ignore"
     )
 
 

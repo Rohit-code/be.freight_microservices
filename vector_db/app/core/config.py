@@ -20,8 +20,8 @@ class Settings(BaseSettings):
     environment: str = "development"
     debug: bool = True
     
-    # ChromaDB settings
-    chroma_db_path: str = "./chroma_db"  # Local storage path
+    # ChromaDB settings - read from env or use default
+    chroma_db_path: str = os.getenv("CHROMA_DB_PATH", "./chroma_db")  # Local storage path
     
     class Config:
         env_file = str(ENV_FILE) if ENV_FILE.exists() else None

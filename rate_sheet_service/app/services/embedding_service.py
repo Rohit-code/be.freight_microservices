@@ -1,6 +1,7 @@
 import httpx
 import logging
 import json
+import asyncio
 from typing import List, Dict, Any, Optional
 from app.core.config import settings
 
@@ -18,131 +19,244 @@ class EmbeddingService:
     
     async def ensure_collection_exists(self):
         """Ensure the rate_sheets collection exists in vector DB"""
-        try:
-            async with httpx.AsyncClient() as client:
-                # Try to create collection (will return existing if already exists)
-                response = await client.post(
-                    f"{self.vector_db_service_url}/api/vector/collections",
-                    json={"name": RATE_SHEETS_COLLECTION},
-                    timeout=30.0
-                )
-                return response.status_code in [200, 201]
-        except Exception as e:
-            logger.error(f"Error ensuring collection exists: {e}")
-            return False
+        max_retries = 3
+        timeout_seconds = 60.0  # Increased timeout for collection creation
+        
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                    # Try to create collection (will return existing if already exists)
+                    response = await client.post(
+                        f"{self.vector_db_service_url}/api/vector/collections",
+                        json={"name": RATE_SHEETS_COLLECTION},
+                        timeout=timeout_seconds
+                    )
+                    if response.status_code in [200, 201]:
+                        logger.info(f"✅ Collection '{RATE_SHEETS_COLLECTION}' exists/created")
+                        return True
+                    else:
+                        logger.warning(f"Unexpected status code {response.status_code} when ensuring collection")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2)
+                            continue
+                        return False
+            except httpx.ReadTimeout as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"⚠️ Timeout ensuring collection exists (attempt {attempt + 1}/{max_retries}), retrying...")
+                    await asyncio.sleep(3)  # Wait 3 seconds before retry
+                    continue
+                else:
+                    logger.error(f"❌ Max retries reached. Failed to ensure collection exists after {max_retries} attempts")
+                    return False
+            except Exception as e:
+                import traceback
+                error_details = str(e) if str(e) else repr(e)
+                logger.error(f"Error ensuring collection exists: {error_details}", exc_info=True)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+                return False
+        
+        return False
     
-    def _build_raw_content(self, rate_sheet_data: Dict[str, Any], parsed_data: Dict[str, Any]) -> str:
+    def _build_semantic_content(self, rate_sheet_data: Dict[str, Any], parsed_data: Dict[str, Any]) -> str:
         """
-        Build full raw content from rate sheet data for storage in ChromaDB
-        Similar to how emails store full raw content + embeddings
+        Build COMPLETE content for vector storage (ChromaDB).
         
-        This stores BOTH:
-        1. AI-analyzed structured data (routes, pricing tiers, surcharges, etc.)
-        2. Raw parsed Excel data (all sheets, columns, rows, merged cells)
+        STORES EVERYTHING:
+        - ALL routes with ALL pricing data (AI-extracted, structured)
+        - ENTIRE sheet text (from Pandas, for semantic search)
+        - Carrier information
+        - Validity dates
+        - Transit times
+        - Free detention
+        - Remarks and notes
         
-        This ensures complete embedding coverage - both structured extraction and original data
+        This ensures semantic search can find ANY data in the rate sheet.
+        BGE embeddings (BAAI/bge-base-en-v1.5) will index everything.
         """
         parts = []
         
-        # File Information
-        parts.append(f"Rate Sheet File: {rate_sheet_data.get('file_name', 'Unknown')}")
+        # ========== AI-EXTRACTED STRUCTURED DATA ==========
+        parts.append("=== AI-EXTRACTED STRUCTURED DATA ===")
+        
+        # ========== METADATA ==========
+        parts.append("=== RATE SHEET METADATA ===")
+        parts.append(f"File: {rate_sheet_data.get('file_name', 'Unknown')}")
         parts.append(f"Carrier: {rate_sheet_data.get('carrier_name', 'Unknown')}")
-        parts.append(f"Type: {rate_sheet_data.get('rate_sheet_type', 'unknown')}")
-        parts.append(f"Title: {rate_sheet_data.get('title', '')}")
+        parts.append(f"Type: {rate_sheet_data.get('rate_sheet_type', 'ocean_freight')}")
         
-        # Validity
+        # Validity (human-readable, useful for semantic search)
         validity = rate_sheet_data.get('validity', {})
-        if validity.get('valid_from'):
-            parts.append(f"Valid From: {validity['valid_from']}")
-        if validity.get('valid_to'):
-            parts.append(f"Valid To: {validity['valid_to']}")
-        if validity.get('effective_date'):
-            parts.append(f"Effective Date: {validity['effective_date']}")
+        if validity:
+            parts.append(f"Valid From: {validity.get('valid_from', 'N/A')}")
+            parts.append(f"Valid To: {validity.get('valid_to', 'N/A')}")
         
-        parts.append("")  # Separator
+        parts.append("")
         
-        # Routes and Pricing (full structured data)
+        # ========== ALL ROUTES WITH ALL PRICING ==========
         routes = rate_sheet_data.get("routes", [])
-        for idx, route in enumerate(routes, 1):
-            parts.append(f"=== Route {idx} ===")
-            parts.append(f"Origin Port: {route.get('origin_port', '')}")
-            parts.append(f"Origin Country: {route.get('origin_country', '')}")
-            parts.append(f"Origin City: {route.get('origin_city', '')}")
-            parts.append(f"Origin Code: {route.get('origin_code', '')}")
-            parts.append(f"Destination Port: {route.get('destination_port', '')}")
-            parts.append(f"Destination Country: {route.get('destination_country', '')}")
-            parts.append(f"Destination City: {route.get('destination_city', '')}")
-            parts.append(f"Destination Code: {route.get('destination_code', '')}")
-            parts.append(f"Routing: {route.get('routing', '')}")
-            parts.append(f"Transit Time: {route.get('transit_time_text', '')} ({route.get('transit_time_days', '')} days)")
-            parts.append(f"Service Type: {route.get('service_type', '')}")
-            parts.append(f"Direct: {route.get('is_direct', False)}")
-            parts.append(f"Free Detention: {route.get('free_detention_text', '')} ({route.get('free_detention_days', '')} days)")
-            parts.append(f"Remarks: {route.get('remarks', '')}")
-            
-            # Pricing Tiers
-            pricing_tiers = route.get("pricing_tiers", [])
-            for tier_idx, tier in enumerate(pricing_tiers, 1):
-                parts.append(f"  --- Pricing Tier {tier_idx} ---")
-                parts.append(f"  Container Type: {tier.get('container_type', '')}")
-                parts.append(f"  Container Size: {tier.get('container_size', '')}")
-                parts.append(f"  Container Height: {tier.get('container_height', '')}")
-                parts.append(f"  Base Rate: {tier.get('base_rate', '')} {tier.get('currency', 'USD')}")
-                if tier.get('min_weight_kg'):
-                    parts.append(f"  Weight Range: {tier.get('min_weight_kg')} - {tier.get('max_weight_kg')} kg")
-                if tier.get('vgm_min_weight_mt'):
-                    parts.append(f"  VGM Range: {tier.get('vgm_min_weight_mt')} - {tier.get('vgm_max_weight_mt')} MT")
-                if tier.get('minimum_charge'):
-                    parts.append(f"  Minimum Charge: {tier.get('minimum_charge')} {tier.get('currency', 'USD')}")
-                if tier.get('remarks'):
-                    parts.append(f"  Remarks: {tier.get('remarks')}")
-                
-                # Surcharges
-                surcharges = tier.get("surcharges", [])
-                if surcharges:
-                    parts.append(f"  Surcharges:")
-                    for surcharge in surcharges:
-                        surcharge_info = f"    - {surcharge.get('surcharge_type', '')}: "
-                        if surcharge.get('is_percentage'):
-                            surcharge_info += f"{surcharge.get('percentage_value', '')}%"
-                        else:
-                            surcharge_info += f"{surcharge.get('amount', '')} {surcharge.get('currency', '')}"
-                        parts.append(surcharge_info)
-                
-                # Charges
-                charges = tier.get("charges", [])
-                if charges:
-                    parts.append(f"  Charges:")
-                    for charge in charges:
-                        charge_info = f"    - {charge.get('charge_type', '')}: {charge.get('amount', '')} {charge.get('currency', '')}"
-                        parts.append(charge_info)
-            
-            parts.append("")  # Route separator
         
-        # Relationships
+        if routes:
+            # Summary for quick reference
+            origins = set()
+            destinations = set()
+            for route in routes:
+                origins.add(route.get('origin_port', 'N/A'))
+                destinations.add(route.get('destination_port', 'N/A'))
+            
+            parts.append("=== ROUTE SUMMARY ===")
+            parts.append(f"Total Routes: {len(routes)}")
+            parts.append(f"Origin Ports: {', '.join(sorted(origins))}")
+            parts.append(f"Destination Ports: {', '.join(sorted(destinations))}")
+            parts.append("")
+            
+            # ========== COMPLETE ROUTE DETAILS ==========
+            parts.append("=== ALL ROUTES AND PRICING ===")
+            
+            for idx, route in enumerate(routes, 1):
+                origin = route.get('origin_port', 'N/A')
+                dest = route.get('destination_port', 'N/A')
+                service = route.get('service_type', 'FCL')
+                routing = route.get('routing', 'N/A')
+                transit_days = route.get('transit_time_days')
+                transit_text = route.get('transit_time_text', '')
+                free_detention_days = route.get('free_detention_days')
+                free_detention_text = route.get('free_detention_text', '')
+                remarks = route.get('remarks', '')
+                
+                # Route header
+                parts.append(f"\nRoute {idx}: {origin} to {dest}")
+                parts.append(f"  Service: {service}")
+                if routing and routing != 'N/A':
+                    parts.append(f"  Routing: {routing}")
+                if transit_days:
+                    parts.append(f"  Transit Time: {transit_days} days")
+                elif transit_text:
+                    parts.append(f"  Transit Time: {transit_text}")
+                if free_detention_days:
+                    parts.append(f"  Free Detention: {free_detention_days} days")
+                elif free_detention_text:
+                    parts.append(f"  Free Detention: {free_detention_text}")
+                
+                # ALL pricing tiers - no truncation
+                pricing_tiers = route.get("pricing_tiers", [])
+                if pricing_tiers:
+                    parts.append(f"  Pricing:")
+                    for tier in pricing_tiers:
+                        container_type = tier.get('container_type', 'N/A')
+                        base_rate = tier.get('base_rate', 'N/A')
+                        currency = tier.get('currency', 'USD')
+                        vgm_max = tier.get('vgm_max_weight_mt')
+                        
+                        price_line = f"    - {container_type}: {currency} {base_rate}"
+                        if vgm_max:
+                            price_line += f" (VGM up to {vgm_max} MT)"
+                        parts.append(price_line)
+                        
+                        # Include surcharges if present (handle None)
+                        surcharges = tier.get('surcharges') or []
+                        if surcharges:
+                            for surcharge in surcharges:
+                                if isinstance(surcharge, dict):
+                                    surcharge_type = surcharge.get('surcharge_type', '')
+                                    surcharge_amount = surcharge.get('amount', '')
+                                    if surcharge_type and surcharge_amount:
+                                        parts.append(f"      + {surcharge_type}: {currency} {surcharge_amount}")
+                
+                # Remarks
+                if remarks:
+                    parts.append(f"  Remarks: {remarks}")
+        
+        # Relationships reasoning (semantic)
         relationships = rate_sheet_data.get("relationships", {})
         if relationships.get("is_related"):
+            parts.append("")
             parts.append("=== Relationships ===")
-            parts.append(f"Relationship Type: {relationships.get('relationship_type', '')}")
-            parts.append(f"Related To: {', '.join(relationships.get('related_to_rate_sheets', []))}")
-            parts.append(f"Reasoning: {relationships.get('reasoning', '')}")
+            parts.append(f"Type: {relationships.get('relationship_type', '')}")
+            if relationships.get('reasoning'):
+                parts.append(f"Reasoning: {relationships.get('reasoning')}")
         
-        # AI Analysis Notes
+        # AI Analysis Notes (semantic)
         if rate_sheet_data.get("extraction_notes"):
             parts.append("")
-            parts.append(f"=== Extraction Notes ===")
+            parts.append("=== Notes ===")
             parts.append(rate_sheet_data.get("extraction_notes", ""))
         
-        # Raw Parsed Excel Data (for complete embedding - includes all original data)
+        # Extract text-heavy content from raw Excel (policies, clauses, notes)
+        # Skip numeric columns, focus on text
         if parsed_data and parsed_data.get("sheets"):
+            text_content = self._extract_text_content(parsed_data)
+            if text_content:
+                parts.append("")
+                parts.append("=== Additional Content ===")
+                parts.append(text_content)
+        
+        # ========== ENTIRE SHEET TEXT (from Pandas) ==========
+        # This ensures semantic search can find ANY data, even if AI extraction missed something
+        full_sheet_text = rate_sheet_data.get("_full_sheet_text")
+        if full_sheet_text:
             parts.append("")
-            parts.append("=== Raw Excel Data ===")
-            parts.append(f"File Type: {parsed_data.get('file_type', '')}")
+            parts.append("=== COMPLETE RAW SHEET DATA (for comprehensive semantic search) ===")
+            parts.append(full_sheet_text)
+            logger.info(f"📄 [EMBEDDING] Including full sheet text: {len(full_sheet_text)} chars")
+        
+        return "\n".join(parts)
+    
+    def _extract_text_content(self, parsed_data: Dict[str, Any]) -> str:
+        """
+        Extract text-heavy content from parsed Excel data.
+        Focuses on columns likely to contain policies, notes, clauses.
+        """
+        text_parts = []
+        text_keywords = ['note', 'remark', 'clause', 'term', 'condition', 'policy', 
+                        'exception', 'description', 'comment', 'info', 'detail']
+        
+        for sheet in parsed_data.get("sheets", []):
+            sheet_data = sheet.get("data", [])
+            columns = sheet.get("columns", [])
+            
+            # Find text-heavy columns
+            for col in columns:
+                col_lower = str(col).lower()
+                if any(kw in col_lower for kw in text_keywords):
+                    # Extract values from this column
+                    for row in sheet_data[:50]:  # Limit rows
+                        val = row.get(col)
+                        if val and isinstance(val, str) and len(val) > 20:
+                            text_parts.append(val)
+        
+        return "\n".join(text_parts[:20])  # Limit to 20 text entries
+    
+    def _build_raw_content(self, rate_sheet_data: Dict[str, Any], parsed_data: Dict[str, Any]) -> str:
+        """
+        Build COMPLETE raw content from BOTH AI-extracted data AND original parsed Excel data.
+        
+        This ensures ChromaDB has EVERYTHING:
+        1. AI-extracted structured data (routes, pricing) - for semantic search
+        2. Complete raw Excel data (all rows, all columns) - for complete sheet reconstruction
+        
+        This is the FULL sheet content, not just what AI extracted.
+        """
+        parts = []
+        
+        # ========== PART 1: AI-EXTRACTED STRUCTURED DATA ==========
+        # This is what AI understood from the sheet
+        parts.append("=== AI-EXTRACTED STRUCTURED DATA ===")
+        parts.append(self._build_semantic_content(rate_sheet_data, parsed_data))
+        parts.append("")
+        
+        # ========== PART 2: COMPLETE RAW EXCEL DATA ==========
+        # This is the FULL original sheet - everything that was in the Excel file
+        parts.append("=== COMPLETE RAW EXCEL SHEET DATA ===")
+        
+        if parsed_data and parsed_data.get("sheets"):
+            parts.append(f"File Type: {parsed_data.get('file_type', 'Unknown')}")
             
             # Excel metadata
             excel_metadata = parsed_data.get("metadata", {})
             if excel_metadata:
-                parts.append("Excel File Properties:")
+                parts.append("\nExcel File Properties:")
                 if excel_metadata.get("title"):
                     parts.append(f"  Title: {excel_metadata.get('title')}")
                 if excel_metadata.get("author"):
@@ -152,44 +266,37 @@ class EmbeddingService:
                 if excel_metadata.get("modified"):
                     parts.append(f"  Modified: {excel_metadata.get('modified')}")
             
-            # All sheets data
+            # ALL sheets with ALL data
             for sheet in parsed_data.get("sheets", []):
                 parts.append("")
                 parts.append(f"--- Sheet: {sheet.get('name', 'Unknown')} ---")
-                parts.append(f"Rows: {sheet.get('rows', 0)}, Columns: {sheet.get('columns_count', 0)}")
+                parts.append(f"Total Rows: {sheet.get('rows', 0)}, Total Columns: {sheet.get('columns_count', 0)}")
                 
                 # Column headers
                 columns = sheet.get("columns", [])
                 if columns:
                     parts.append(f"Columns: {', '.join(str(col) for col in columns)}")
                 
-                # Merged cells info
-                merged_cells = sheet.get("merged_cells", [])
-                if merged_cells:
-                    parts.append(f"Merged Cells: {', '.join(merged_cells[:10])}")  # First 10
-                
-                # Sample data (all rows as text representation)
+                # ALL ROWS - no truncation (complete sheet)
                 sheet_data = sheet.get("data", [])
                 if sheet_data:
-                    parts.append("Data:")
-                    # Include all rows (or limit to reasonable size for embedding)
-                    max_rows_for_embedding = 100  # Limit to prevent huge embeddings
-                    for idx, row in enumerate(sheet_data[:max_rows_for_embedding], 1):
-                        row_str = " | ".join(f"{k}: {v}" for k, v in row.items() if v is not None and str(v).strip())
-                        if row_str:
-                            parts.append(f"  Row {idx}: {row_str}")
-                    
-                    if len(sheet_data) > max_rows_for_embedding:
-                        parts.append(f"  ... ({len(sheet_data) - max_rows_for_embedding} more rows)")
+                    parts.append("\nComplete Sheet Data (All Rows):")
+                    for idx, row in enumerate(sheet_data, 1):
+                        # Convert row to readable format
+                        row_values = []
+                        for col_idx, col_name in enumerate(columns):
+                            if col_idx < len(row):
+                                cell_value = row[col_idx] if isinstance(row, (list, tuple)) else row.get(col_name, "")
+                                if cell_value is not None and str(cell_value).strip():
+                                    row_values.append(f"{col_name}: {cell_value}")
+                        
+                        if row_values:
+                            parts.append(f"  Row {idx}: {' | '.join(row_values)}")
                 
-                # Sample data per column (for reference)
-                sample_data = sheet.get("sample_data", {})
-                if sample_data:
-                    parts.append("Column Samples:")
-                    for col_name, col_info in list(sample_data.items())[:20]:  # First 20 columns
-                        parts.append(f"  {col_name}: {col_info.get('dtype', '')}, "
-                                   f"non-null: {col_info.get('non_null_count', 0)}, "
-                                   f"sample: {col_info.get('sample_values', [])[:3]}")
+                # Merged cells info (if any)
+                merged_cells = sheet.get("merged_cells", [])
+                if merged_cells:
+                    parts.append(f"\nMerged Cells: {', '.join(merged_cells[:20])}")  # First 20
         
         return "\n".join(parts)
     
@@ -245,27 +352,52 @@ class EmbeddingService:
             }
             
             # Store in vector DB (same pattern as email service)
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                response = await client.post(
-                    f"{self.vector_db_service_url}/api/vector/collections/{RATE_SHEETS_COLLECTION}/documents",
-                    json={
-                        "documents": [raw_content],  # Full raw content for retrieval + embeddings
-                        "metadatas": [full_metadata],  # All metadata fields
-                        "ids": [rate_sheet_id]
-                    },
-                    timeout=60.0  # Longer timeout for embedding generation
-                )
-                
-                if response.status_code == 200:
-                    logger.info(f"Stored rate sheet {rate_sheet_id} in ChromaDB (raw content + BGE embeddings)")
-                    return rate_sheet_id
-                else:
-                    logger.error(f"Failed to store rate sheet: {response.text}")
-                    raise Exception(f"Failed to store rate sheet: {response.text}")
+            # Use longer timeout for large documents with COMPLETE data and implement retry logic
+            max_retries = 3
+            timeout_seconds = 180.0  # 3 minutes for large documents with all routes/pricing
+            
+            # Log content size for monitoring
+            content_size = len(raw_content)
+            logger.info(f"Storing rate sheet {rate_sheet_id} in ChromaDB: {content_size} chars, {len(rate_sheet_data.get('routes', []))} routes")
+            
+            for attempt in range(max_retries):
+                try:
+                    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                        response = await client.post(
+                            f"{self.vector_db_service_url}/api/vector/collections/{RATE_SHEETS_COLLECTION}/documents",
+                            json={
+                                "documents": [raw_content],  # COMPLETE content with all routes + pricing + BGE embeddings
+                                "metadatas": [full_metadata],  # All metadata fields
+                                "ids": [rate_sheet_id]
+                            },
+                            timeout=timeout_seconds
+                        )
+                        
+                        if response.status_code == 200:
+                            logger.info(f"✅ Stored rate sheet {rate_sheet_id} in ChromaDB ({content_size} chars, BGE embeddings)")
+                            return rate_sheet_id
+                        else:
+                            logger.error(f"Failed to store rate sheet: {response.text}")
+                            if attempt < max_retries - 1:
+                                logger.info(f"Retrying... (attempt {attempt + 2}/{max_retries})")
+                                await asyncio.sleep(3)  # Wait 3 seconds before retry
+                                continue
+                            raise Exception(f"Failed to store rate sheet: {response.text}")
+                            
+                except httpx.ReadTimeout as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"⚠️ Timeout storing rate sheet (attempt {attempt + 1}/{max_retries}), retrying with longer wait...")
+                        await asyncio.sleep(5)  # Wait 5 seconds before retry on timeout
+                        continue
+                    else:
+                        logger.error(f"❌ Max retries reached. Failed to store rate sheet after {max_retries} attempts ({content_size} chars)")
+                        raise Exception(f"Failed to store rate sheet in ChromaDB: ReadTimeout after {max_retries} attempts") from e
         
         except Exception as e:
-            logger.error(f"Error storing rate sheet in ChromaDB: {e}")
-            raise
+            import traceback
+            error_details = str(e) if str(e) else repr(e)
+            logger.error(f"Error storing rate sheet in ChromaDB: {error_details}", exc_info=True)
+            raise Exception(f"Failed to store rate sheet in ChromaDB: {error_details}") from e
     
     async def search_rate_sheets(
         self,

@@ -71,9 +71,10 @@ class AuthService:
                     import httpx
                     async def trigger_email_fetch():
                         try:
+                            from app.core.config import settings
                             async with httpx.AsyncClient() as client:
                                 await client.post(
-                                    "http://localhost:8005/api/email/fetch",
+                                    f"{settings.EMAIL_SERVICE_URL}/api/email/fetch",
                                     json={"user_id": user.id},
                                     headers={"Authorization": f"Bearer {token}"},
                                     timeout=60.0  # Increased timeout - email fetch can take time
@@ -463,6 +464,8 @@ class AuthService:
                     picture=user.picture,
                     is_google_user=user.is_google_user,
                     has_google_connected=bool(user.google_access_token),
+                    email_drafting_enabled=user.email_drafting_enabled,
+                    email_drafting_enabled_at=user.email_drafting_enabled_at.isoformat() if user.email_drafting_enabled_at else None,
                 )
                 
                 return AuthResponse(
@@ -1019,23 +1022,33 @@ class AuthService:
             # Get new emails since historyId
             # Note: The historyId in webhook is the NEW historyId after email was added
             # We need to get messages added since the PREVIOUS historyId
-            # For now, we'll use the list API to get recent messages and filter duplicates
+            # Use stored last_processed_history_id if available, otherwise use historyId - 1
+            start_history_id = user_obj.last_processed_history_id
+            
+            if not start_history_id:
+                # If no stored historyId, try using historyId - 1 (approximation)
+                try:
+                    current_id = int(history_id)
+                    start_history_id = str(current_id - 1)
+                    logger.info(f"⚠️  No stored historyId, using approximation: {start_history_id}")
+                except (ValueError, TypeError):
+                    # If historyId is not numeric, we'll fall back to list API
+                    start_history_id = None
+                    logger.warning(f"⚠️  Cannot parse historyId {history_id}, will use list API fallback")
+            
             new_message_ids = []
-            try:
-                # Try to get history, but if it fails or returns empty, fall back to list API
-                # Get more messages from history (increased from 50 to 100)
-                history_result = await get_history_since(user_obj, history_id, max_results=100)
-                new_message_ids = history_result.get('newMessageIds', [])
-                logger.info(f"✅ Found {len(new_message_ids)} new messages since historyId {history_id}")
-                
-                # If history API returns empty, it might mean historyId is too new or expired
-                # Fall through to list API to get recent messages anyway
-                if not new_message_ids:
-                    logger.info("History API returned no new messages, will use list API to get recent messages")
-                
-            except Exception as e:
-                logger.warning(f"Could not get history (may be expired), falling back to list API: {e}")
-                new_message_ids = []
+            if start_history_id:
+                try:
+                    # Get history since the PREVIOUS historyId (not the new one)
+                    logger.info(f"📜 Getting history since historyId {start_history_id} (previous)")
+                    history_result = await get_history_since(user_obj, start_history_id, max_results=100)
+                    new_message_ids = history_result.get('newMessageIds', [])
+                    logger.info(f"✅ Found {len(new_message_ids)} new messages since historyId {start_history_id}")
+                except Exception as e:
+                    logger.warning(f"Could not get history (may be expired), falling back to list API: {e}")
+                    new_message_ids = []
+            else:
+                logger.info("No start historyId available, will use list API fallback")
             
             # Trigger email fetch via email service internal API
             # Use longer timeout for Gmail API calls which can be slow
@@ -1047,13 +1060,14 @@ class AuthService:
                     messages_to_process = [{"id": msg_id} for msg_id in new_message_ids[:50]]
                     logger.info(f"📬 Processing {len(messages_to_process)} new messages from history")
                 else:
-                    # Fallback: get recent messages (increase limit to check more emails)
+                    # Fallback: get only the most recent messages (limit to 5 to avoid processing old emails)
+                    # This is a fallback when history API doesn't work - we only check the newest emails
                     gmail_list_url = f"http://localhost:8001/api/auth/internal/gmail/{user_id}/list"
-                    logger.info(f"GET {gmail_list_url}?max_results=50")
+                    logger.info(f"GET {gmail_list_url}?max_results=5 (fallback - checking only newest)")
                     try:
                         response = await client.get(
                             gmail_list_url,
-                            params={"max_results": 50},  # Increased from 10 to 50
+                            params={"max_results": 5},  # Only check newest 5 emails as fallback
                             timeout=60.0  # Increased timeout for Gmail API calls
                         )
                         
@@ -1065,6 +1079,7 @@ class AuthService:
                         
                         gmail_data = response.json()
                         messages_to_process = gmail_data.get('messages', [])
+                        logger.info(f"⚠️  Using list API fallback - checking {len(messages_to_process)} recent emails (may include already processed)")
                     except (httpx.TimeoutException, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
                         # Log timeout with context (no silent failure per BACKEND_REVIEW.md)
                         logger.warning(
@@ -1181,7 +1196,8 @@ class AuthService:
                             logger.info(f"📧 Email: '{subject}' from {from_email}")
                             
                             # Store in email service with auto-draft enabled
-                            store_url = "http://localhost:8005/api/email/store"
+                            from app.core.config import settings
+                            store_url = f"{settings.EMAIL_SERVICE_URL}/api/email/store"
                             store_payload = {
                                 "user_id": user_id,
                                 "gmail_message_id": msg_id,
@@ -1263,6 +1279,21 @@ class AuthService:
                         # Continue processing other emails (don't fail entire webhook)
                 
                 logger.info(f"✅ Gmail notification processed: {processed_count} new emails stored, {skipped_existing} already existed, {len(messages_to_process)} total checked")
+                
+                # Update last processed historyId for this user
+                if processed_count > 0 or new_message_ids:
+                    # Update stored historyId to the new one from webhook
+                    # Ensure history_id is a string (database column is VARCHAR)
+                    history_id_str = str(history_id) if history_id else None
+                    async with AsyncSessionLocal() as session:
+                        result = await session.execute(
+                            select(UserModel).where(UserModel.id == user_id)
+                        )
+                        user_obj = result.scalar_one_or_none()
+                        if user_obj:
+                            user_obj.last_processed_history_id = history_id_str
+                            await session.commit()
+                            logger.info(f"✅ Updated last_processed_history_id to {history_id_str} for user {user_id}")
                     
         except Exception as e:
             # Log top-level error with full context (no silent failure)
@@ -1277,6 +1308,94 @@ class AuthService:
             )
             # Re-raise to let webhook handler decide (may want to return error to Pub/Sub)
             raise
+
+
+    async def enable_email_drafting(self, token: str) -> dict:
+        """Enable email auto-drafting for the current user"""
+        from datetime import datetime, timezone
+        from ..utils.jwt import verify_jwt_token
+        
+        try:
+            # Verify JWT token
+            payload = verify_jwt_token(token)
+            user_id = payload.get('user_id')
+            
+            if not user_id:
+                raise ValueError("Invalid token payload")
+            
+            async with AsyncSessionLocal() as session:
+                user_obj = await session.get(User, user_id)
+                if not user_obj:
+                    raise ValueError("User not found")
+                
+                # Enable drafting and set timestamp
+                user_obj.email_drafting_enabled = True
+                user_obj.email_drafting_enabled_at = datetime.now(timezone.utc)
+                await session.commit()
+                await session.refresh(user_obj)
+                
+                logger.info(f"✅ Enabled email drafting for user {user_id} at {user_obj.email_drafting_enabled_at}")
+                
+                return {
+                    "status": "success",
+                    "message": "Email auto-drafting enabled",
+                    "email_drafting_enabled": True,
+                    "email_drafting_enabled_at": user_obj.email_drafting_enabled_at.isoformat() if user_obj.email_drafting_enabled_at else None
+                }
+        except ValueError as e:
+            raise ValueError(str(e))
+        except Exception as e:
+            logger.error(f"Error enabling email drafting: {e}", exc_info=True)
+            raise ValueError(f"Failed to enable email drafting: {str(e)}")
+    
+    async def disable_email_drafting(self, token: str) -> dict:
+        """Disable email auto-drafting for the current user"""
+        from ..utils.jwt import verify_jwt_token
+        
+        try:
+            # Verify JWT token
+            payload = verify_jwt_token(token)
+            user_id = payload.get('user_id')
+            
+            if not user_id:
+                raise ValueError("Invalid token payload")
+            
+            async with AsyncSessionLocal() as session:
+                user_obj = await session.get(User, user_id)
+                if not user_obj:
+                    raise ValueError("User not found")
+                
+                # Disable drafting (but keep timestamp for reference)
+                user_obj.email_drafting_enabled = False
+                await session.commit()
+                
+                logger.info(f"✅ Disabled email drafting for user {user_id}")
+                
+                return {
+                    "status": "success",
+                    "message": "Email auto-drafting disabled",
+                    "email_drafting_enabled": False
+                }
+        except ValueError as e:
+            raise ValueError(str(e))
+        except Exception as e:
+            logger.error(f"Error disabling email drafting: {e}", exc_info=True)
+            raise ValueError(f"Failed to disable email drafting: {str(e)}")
+    
+    async def get_user_drafting_status(self, user_id: int) -> dict:
+        """Get email drafting status for a user (internal service call)"""
+        async with AsyncSessionLocal() as session:
+            user_obj = await session.get(User, user_id)
+            if not user_obj:
+                return {
+                    "email_drafting_enabled": False,
+                    "email_drafting_enabled_at": None
+                }
+            
+            return {
+                "email_drafting_enabled": user_obj.email_drafting_enabled,
+                "email_drafting_enabled_at": user_obj.email_drafting_enabled_at.isoformat() if user_obj.email_drafting_enabled_at else None
+            }
 
 
 auth_service = AuthService()

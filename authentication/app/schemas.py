@@ -10,6 +10,8 @@ class UserOut(BaseModel):
     picture: Optional[str] = None
     is_google_user: bool = False
     has_google_connected: bool = False
+    email_drafting_enabled: Optional[bool] = False
+    email_drafting_enabled_at: Optional[str] = None
 
 
 class AuthResponse(BaseModel):

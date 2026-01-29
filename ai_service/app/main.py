@@ -49,4 +49,5 @@ app.include_router(ai_router)
 
 @app.get("/health")
 async def health_check():
+    """Simple health check - doesn't check AI availability to avoid blocking"""
     return {"status": "ok", "service": "ai"}

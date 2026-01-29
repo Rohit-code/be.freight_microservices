@@ -79,7 +79,12 @@ def _metadata_to_email(doc_id: str, metadata: Dict[str, Any], content: str = "")
     return email
 
 
-def _email_to_metadata(email: EmailCreate, email_id: str, drafted_response: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _email_to_metadata(
+    email: EmailCreate, 
+    email_id: str, 
+    drafted_response: Optional[Dict[str, Any]] = None,
+    ai_analysis: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """Convert EmailCreate to vector DB metadata"""
     now = datetime.utcnow().isoformat()
     metadata = {
@@ -106,6 +111,14 @@ def _email_to_metadata(email: EmailCreate, email_id: str, drafted_response: Opti
         "updated_at": now,
     }
     
+    # Store AI analysis if available (like rate sheets do)
+    if ai_analysis:
+        import json
+        metadata["ai_analysis"] = json.dumps(ai_analysis)
+        metadata["ai_summary"] = ai_analysis.get("summary", "")[:500]  # Truncate for metadata
+        metadata["ai_sentiment"] = ai_analysis.get("sentiment", "neutral")
+        metadata["ai_priority"] = ai_analysis.get("priority", "medium")
+    
     # Store drafted response if available
     if drafted_response:
         import json
@@ -117,15 +130,113 @@ def _email_to_metadata(email: EmailCreate, email_id: str, drafted_response: Opti
 
 async def get_user_organization_id(user_id: int) -> Optional[int]:
     """
-    Get user's organization_id from user service.
-    Note: This requires authentication, so it may not work in webhook context.
+    Get user's organization_id from user service (internal endpoint).
+    This is a service-to-service call, no auth token required.
     Returns None if organization cannot be determined.
     """
-    # Note: Getting organization_id requires authentication token.
-    # In webhook context, organization_id should be passed by the caller.
-    # This function is a fallback that may not work without a token.
-    logger.debug(f"Attempting to get organization_id for user {user_id} (may require token)")
-    return None  # Simplified - caller should provide organization_id
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            org_url = f"{settings.USER_SERVICE_URL}/api/user/internal/user/{user_id}/organization-id"
+            logger.debug(f"Getting organization_id from user service: {org_url}")
+            response = await client.get(org_url)
+            
+            if response.status_code == 200:
+                org_data = response.json()
+                organization_id = org_data.get('organization_id')
+                if organization_id:
+                    logger.info(f"✅ Got organization_id: {organization_id} for user {user_id}")
+                    return organization_id
+                else:
+                    logger.debug(f"User {user_id} has no organization: {org_data.get('message', 'Unknown')}")
+                    return None
+            else:
+                logger.warning(f"Failed to get organization_id: HTTP {response.status_code}")
+                return None
+    except Exception as e:
+        logger.warning(f"Could not get organization_id for user {user_id}: {e}")
+        return None
+
+
+async def get_user_drafting_status(user_id: int) -> Dict[str, Any]:
+    """
+    Get user's email drafting status from auth service (internal endpoint).
+    Returns drafting enabled status and timestamp.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Use internal endpoint to get drafting status
+            drafting_url = f"{settings.AUTH_SERVICE_URL}/api/auth/internal/user/{user_id}/drafting-status"
+            logger.debug(f"Getting drafting status from auth service: {drafting_url}")
+            response = await client.get(drafting_url)
+            
+            if response.status_code == 200:
+                drafting_data = response.json()
+                return {
+                    "email_drafting_enabled": drafting_data.get("email_drafting_enabled", False),
+                    "email_drafting_enabled_at": drafting_data.get("email_drafting_enabled_at")
+                }
+            else:
+                logger.warning(f"Failed to get drafting status: HTTP {response.status_code}")
+                return {"email_drafting_enabled": False, "email_drafting_enabled_at": None}
+    except Exception as e:
+        logger.warning(f"Could not get drafting status for user {user_id}: {e}")
+        return {"email_drafting_enabled": False, "email_drafting_enabled_at": None}
+
+
+def should_draft_email(email_date: Optional[str], drafting_enabled_at: Optional[str]) -> bool:
+    """
+    Check if an email should be drafted based on:
+    1. Drafting must be enabled
+    2. Email must have arrived AFTER drafting was enabled
+    """
+    if not drafting_enabled_at:
+        return False  # Drafting never enabled
+    
+    if not email_date:
+        return False  # Can't determine email date
+    
+    try:
+        from datetime import datetime
+        from email.utils import parsedate_to_datetime
+        
+        # Parse email date - handle both RFC 2822 (email format) and ISO format
+        email_dt = None
+        
+        # Try RFC 2822 format first (e.g., "Tue, 27 Jan 2026 21:59:36 +0530")
+        try:
+            email_dt = parsedate_to_datetime(email_date)
+        except (TypeError, ValueError):
+            pass
+        
+        # Fallback to ISO format
+        if email_dt is None:
+            try:
+                email_dt = datetime.fromisoformat(email_date.replace('Z', '+00:00'))
+            except (TypeError, ValueError):
+                pass
+        
+        if email_dt is None:
+            logger.warning(f"Could not parse email date: {email_date}")
+            return True  # If we can't parse email date, assume it's new and draft it
+        
+        # Parse enabled timestamp (always ISO format from database)
+        enabled_dt = datetime.fromisoformat(drafting_enabled_at.replace('Z', '+00:00'))
+        
+        # Make both timezone-aware for comparison
+        if email_dt.tzinfo is None:
+            from datetime import timezone
+            email_dt = email_dt.replace(tzinfo=timezone.utc)
+        if enabled_dt.tzinfo is None:
+            from datetime import timezone
+            enabled_dt = enabled_dt.replace(tzinfo=timezone.utc)
+        
+        # Only draft if email arrived AFTER drafting was enabled
+        should_draft = email_dt >= enabled_dt
+        logger.debug(f"Date comparison: email_dt={email_dt.isoformat()}, enabled_dt={enabled_dt.isoformat()}, should_draft={should_draft}")
+        return should_draft
+    except Exception as e:
+        logger.warning(f"Error comparing dates: {e}, email_date={email_date}, enabled_at={drafting_enabled_at}")
+        return True  # If we can't parse dates, assume new email and draft it
 
 
 async def draft_email_response_auto(email_data: EmailCreate, organization_id: int) -> Optional[Dict[str, Any]]:
@@ -175,15 +286,33 @@ async def draft_email_response_auto(email_data: EmailCreate, organization_id: in
                     logger.info(f"Auto-draft skipped for email {email_data.gmail_message_id}: {draft_data.get('skip_reason', 'Unknown reason')}")
                     return None  # Don't store skipped drafts
                 
-                # Check confidence threshold - don't auto-draft if confidence is too low
+                # Map response fields to frontend-expected format
+                # Rate Sheet Service returns: {draft: {...}, confidence_score: ...}
+                # Frontend expects: {drafted_email: {...}, confidence_score: ...}
+                if "draft" in draft_data and "drafted_email" not in draft_data:
+                    draft_data["drafted_email"] = draft_data.pop("draft")
+                    logger.debug(f"Mapped 'draft' to 'drafted_email' for email {email_data.gmail_message_id}")
+                
+                # Always return draft - mark for review if confidence is low
+                # User can decide whether to use the draft even if confidence is low
                 confidence = draft_data.get("confidence_score", 0.0)
-                MIN_AUTO_DRAFT_CONFIDENCE = 0.50  # 50% minimum for auto-drafting
+                MIN_AUTO_DRAFT_CONFIDENCE = 0.30  # 30% minimum - below this, mark for review
                 
                 if confidence < MIN_AUTO_DRAFT_CONFIDENCE:
-                    logger.info(f"Auto-draft skipped for email {email_data.gmail_message_id} - confidence too low ({confidence:.2%} < {MIN_AUTO_DRAFT_CONFIDENCE:.2%})")
-                    return None  # Don't auto-draft low confidence responses
+                    logger.info(f"⚠️  Low confidence draft for email {email_data.gmail_message_id} ({confidence:.2%} < {MIN_AUTO_DRAFT_CONFIDENCE:.2%})")
+                    # Mark as low confidence for manual review
+                    draft_data["low_confidence"] = True
+                    draft_data["requires_review"] = True
+                    draft_data["confidence_warning"] = f"Low confidence ({confidence:.2%}) - please review before sending"
+                    logger.info(f"✅ Draft generated but marked for review (confidence: {confidence:.2%})")
+                else:
+                    logger.info(f"✅ Successfully auto-drafted response for email {email_data.gmail_message_id} (confidence: {confidence:.2%})")
                 
-                logger.info(f"Successfully auto-drafted response for email {email_data.gmail_message_id} (confidence: {confidence:.2%})")
+                # Log the draft content for debugging
+                drafted_email = draft_data.get("drafted_email", {})
+                logger.info(f"📝 Draft content for email {email_data.gmail_message_id}: subject='{drafted_email.get('subject', 'N/A')}', body_length={len(drafted_email.get('body', ''))}")
+                
+                # Always return draft (even if low confidence) - let user decide
                 return draft_data
             else:
                 error_text = draft_response.text[:500] if hasattr(draft_response, 'text') else "No error text"
@@ -353,10 +482,69 @@ async def store_email(email_data: EmailCreate, organization_id: Optional[int] = 
                 else:
                     logger.info(f"✅ Got organization_id: {org_id}")
             
+            # AI Analysis: Extract structured data from email (like rate sheets do)
+            # Always analyze emails - use subject if body is empty
+            ai_analysis = None
+            try:
+                # Get email content - use subject if body is empty (some emails are subject-only)
+                email_content = email_data.body_plain or email_data.snippet or email_data.subject or ""
+                
+                if not email_content:
+                    logger.debug(f"⚠️  No content available for AI analysis for {email_data.gmail_message_id}, skipping")
+                else:
+                    logger.info(f"🤖 Analyzing email {email_data.gmail_message_id} with AI (content length: {len(email_content)})...")
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        try:
+                            analysis_response = await client.post(
+                                f"{settings.AI_SERVICE_URL}/api/ai/analyze-email",
+                                json={
+                                    "content": email_content,
+                                    "subject": email_data.subject or "",
+                                    "from": email_data.from_email or ""
+                                },
+                                timeout=30.0
+                            )
+                            analysis_response.raise_for_status()  # Raise exception for non-200 status codes
+                            ai_analysis = analysis_response.json()
+                            logger.info(f"✅ AI analysis completed for email {email_data.gmail_message_id}: sentiment={ai_analysis.get('sentiment', 'unknown')}, priority={ai_analysis.get('priority', 'unknown')}")
+                        except httpx.HTTPStatusError as e:
+                            error_text = ""
+                            try:
+                                error_text = e.response.text[:200] if e.response else "No response"
+                            except:
+                                pass
+                            logger.warning(f"⚠️  AI analysis HTTP error (non-critical): {e.response.status_code if e.response else 'Unknown'} - {error_text}, continuing without analysis")
+                        except httpx.TimeoutException:
+                            logger.warning(f"⚠️  AI analysis timeout (non-critical): Request took longer than 30s, continuing without analysis")
+            except httpx.ConnectError as e:
+                logger.warning(f"⚠️  AI service connection error (non-critical): Cannot connect to {settings.AI_SERVICE_URL} - {str(e) or 'Connection refused'}, continuing without analysis")
+            except Exception as e:
+                error_msg = str(e) if str(e) else f"{type(e).__name__} (no message)"
+                logger.warning(f"⚠️  AI analysis error (non-critical): {error_msg}, continuing without analysis", exc_info=True)
+            
+            # Check if user has enabled email drafting and if email should be drafted
+            # Only draft emails that arrived AFTER drafting was enabled
+            should_draft = False
+            if auto_draft and org_id:
+                # Get user's drafting status
+                drafting_status = await get_user_drafting_status(email_data.user_id)
+                drafting_enabled = drafting_status.get("email_drafting_enabled", False)
+                drafting_enabled_at = drafting_status.get("email_drafting_enabled_at")
+                
+                if drafting_enabled:
+                    # Check if email arrived after drafting was enabled
+                    should_draft = should_draft_email(email_data.date, drafting_enabled_at)
+                    if should_draft:
+                        logger.info(f"✅ Drafting enabled - will draft email {email_data.gmail_message_id} (arrived after {drafting_enabled_at})")
+                    else:
+                        logger.info(f"⏭️  Skipping draft for email {email_data.gmail_message_id} - arrived before drafting was enabled ({email_data.date} < {drafting_enabled_at})")
+                else:
+                    logger.info(f"⏭️  Skipping draft for email {email_data.gmail_message_id} - drafting not enabled by user")
+            
             # Store email first, then draft response asynchronously (non-blocking)
             # This ensures emails are always stored even if drafting takes a long time
             drafted_response = None
-            if auto_draft and org_id:
+            if should_draft and org_id:
                 logger.info(f"🤖 Will auto-draft response for email {email_data.gmail_message_id} with org_id {org_id} (async)")
                 # Start async draft task (fire and forget) - runs in background
                 # Email will be stored immediately, draft will be added when ready
@@ -370,7 +558,7 @@ async def store_email(email_data: EmailCreate, organization_id: Optional[int] = 
                     # If no event loop, create a new one
                     asyncio.ensure_future(_draft_and_update_email_async(email_id, email_data, org_id))
             else:
-                logger.info(f"ℹ️  Skipping auto-draft (auto_draft={auto_draft}, org_id={org_id})")
+                logger.info(f"ℹ️  Skipping auto-draft (should_draft={should_draft}, org_id={org_id})")
             
             # Create full raw email content as a structured string
             # Store complete email content for both retrieval and semantic search
@@ -399,8 +587,8 @@ async def store_email(email_data: EmailCreate, organization_id: Optional[int] = 
             # Full raw email content as document (for retrieval + embeddings)
             raw_email_content = "\n".join(raw_email_content_parts)
             
-            # Create metadata (including drafted response if available)
-            metadata = _email_to_metadata(email_data, email_id, drafted_response)
+            # Create metadata (including drafted response and AI analysis if available)
+            metadata = _email_to_metadata(email_data, email_id, drafted_response, ai_analysis)
             
             # Store the email (vector DB's add method handles upsert, so duplicates are safe)
             async with httpx.AsyncClient() as client:

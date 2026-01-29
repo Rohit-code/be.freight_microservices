@@ -9,6 +9,9 @@ from app.core.config import settings
 from app.core.database import init_db, close_db
 from app.api.routes import router
 
+# Import models so SQLAlchemy can create tables
+from app.models import RateSheetStructuredData, Route, PricingTier, Surcharge  # noqa: F401
+
 # Set up shared logging configuration with fallback
 SHARED_PATH = Path(__file__).parent.parent.parent.parent / "shared"
 if str(SHARED_PATH) not in sys.path:

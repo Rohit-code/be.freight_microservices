@@ -1,9 +1,9 @@
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query, Request, Header
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query, Request, Header, BackgroundTasks
 from typing import List, Optional
 import logging
 
 from app.services.rate_sheet_service import RateSheetService
-from app.services.email_response_service import EmailResponseService
+from app.services.email_response_service_v2 import EmailResponseServiceV2
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +78,122 @@ async def upload_rate_sheet(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error uploading rate sheet: {e}")
-        raise HTTPException(status_code=500, detail=f"Error processing rate sheet: {str(e)}")
+        import traceback
+        error_details = str(e) if str(e) else repr(e)
+        logger.error(f"Error uploading rate sheet: {error_details}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing rate sheet: {error_details}")
+
+
+@router.post("/upload-async", status_code=202)
+async def upload_rate_sheet_async(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    organization_id: int = Query(...),
+    user_id: int = Query(...)
+):
+    """
+    Upload a rate sheet file asynchronously (non-blocking).
+    
+    Returns immediately with a rate_sheet_id and status='pending'.
+    The file is processed in the background.
+    
+    Use GET /api/rate-sheets/{id}/status to poll for completion.
+    
+    - **file**: Excel/CSV file (.xlsx, .xls, .csv)
+    - **organization_id**: Organization ID
+    - **user_id**: User ID who uploaded
+    
+    Returns:
+        - id: Rate sheet ID for polling
+        - status: 'pending' (will change to 'processed' or 'failed')
+        - message: Status message
+    """
+    # Validate file type
+    allowed_extensions = ['.xlsx', '.xls', '.csv']
+    file_ext = '.' + file.filename.split('.')[-1].lower() if '.' in file.filename else ''
+    
+    if file_ext not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type. Allowed: {', '.join(allowed_extensions)}"
+        )
+    
+    try:
+        file_content = await file.read()
+        
+        # Validate file size (50MB max)
+        max_size = 50 * 1024 * 1024
+        if len(file_content) > max_size:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File too large. Maximum size: 50MB"
+            )
+        
+        # Create pending record (fast, returns immediately)
+        service = RateSheetService()
+        result = await service.upload_rate_sheet(
+            file_content=file_content,
+            file_name=file.filename,
+            organization_id=organization_id,
+            user_id=user_id,
+            async_mode=True  # Return immediately
+        )
+        
+        # Queue background processing
+        rate_sheet_id = result["id"]
+        background_tasks.add_task(
+            _process_rate_sheet_background,
+            rate_sheet_id
+        )
+        
+        logger.info(f"📋 Queued rate sheet {rate_sheet_id} for background processing")
+        
+        return result
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        error_details = str(e) if str(e) else repr(e)
+        logger.error(f"Error uploading rate sheet (async): {error_details}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error uploading rate sheet: {error_details}")
+
+
+async def _process_rate_sheet_background(rate_sheet_id: str):
+    """Background task to process a rate sheet"""
+    try:
+        service = RateSheetService()
+        await service.process_rate_sheet_background(rate_sheet_id)
+    except Exception as e:
+        import traceback
+        error_details = str(e) if str(e) else repr(e)
+        logger.error(f"Background processing failed for {rate_sheet_id}: {error_details}", exc_info=True)
+
+
+@router.get("/{rate_sheet_id}/status")
+async def get_rate_sheet_status(
+    rate_sheet_id: str,
+    organization_id: int = Query(...)
+):
+    """
+    Get the processing status of a rate sheet.
+    
+    Use this endpoint to poll for completion after async upload.
+    
+    Returns:
+        - id: Rate sheet ID
+        - status: 'pending', 'processing', 'processed', or 'failed'
+        - processing_error: Error message if status='failed'
+        - carrier_name: Carrier name (if processed)
+        - version: Version number
+    """
+    service = RateSheetService()
+    status = await service.get_rate_sheet_status(rate_sheet_id, organization_id)
+    
+    if not status:
+        raise HTTPException(status_code=404, detail="Rate sheet not found")
+    
+    return status
 
 
 @router.get("/{rate_sheet_id}")
@@ -184,6 +298,56 @@ async def delete_rate_sheet(
     return None
 
 
+@router.post("/query-routes", status_code=200)
+async def query_routes(
+    request: Request,
+    organization_id: int = Query(...)
+):
+    """
+    Query routes from structured data (PostgreSQL)
+    Used by orchestrator service for SQL retrieval
+    
+    Body should contain:
+    - origin_port: (optional) Origin port code
+    - destination_port: (optional) Destination port code
+    - container_type: (optional) Container type
+    - valid_date: (optional) ISO format date string
+    """
+    try:
+        from app.core.database import AsyncSessionLocal
+        from app.services.structured_data_service import StructuredDataService
+        from datetime import datetime
+        
+        body_data = await request.json()
+        origin_port = body_data.get("origin_port")
+        destination_port = body_data.get("destination_port")
+        container_type = body_data.get("container_type")
+        valid_date_str = body_data.get("valid_date")
+        
+        valid_date = None
+        if valid_date_str:
+            try:
+                valid_date = datetime.fromisoformat(valid_date_str.replace('Z', '+00:00'))
+            except Exception:
+                pass
+        
+        async with AsyncSessionLocal() as session:
+            service = StructuredDataService()
+            routes = await service.query_routes(
+                session=session,
+                organization_id=organization_id,
+                origin_port=origin_port,
+                destination_port=destination_port,
+                container_type=container_type,
+                valid_date=valid_date
+            )
+            return {"routes": routes, "count": len(routes)}
+    
+    except Exception as e:
+        logger.error(f"Error querying routes: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/draft-email-response", status_code=200)
 async def draft_email_response(
     request: Request,
@@ -213,13 +377,12 @@ async def draft_email_response(
                 detail="Missing required field: email_query"
             )
         
-        service = EmailResponseService()
+        service = EmailResponseServiceV2()
         result = await service.draft_email_response(
-            email_query=email_query,
             organization_id=organization_id,
-            original_email_subject=original_email_subject,
-            original_email_from=original_email_from,
-            limit=limit
+            email_content=email_query,
+            subject=original_email_subject,
+            from_email=original_email_from
         )
         
         return result
@@ -495,3 +658,232 @@ async def admin_rate_sheet_stats(
             status_code=500,
             detail=f"Failed to get rate sheet stats: {str(e)}",
         )
+
+
+@router.post("/{rate_sheet_id}/reprocess", status_code=200)
+async def reprocess_rate_sheet(
+    rate_sheet_id: str,
+    organization_id: int = Query(...)
+):
+    """
+    Reprocess a rate sheet that failed AI extraction.
+    
+    Use this to retry extraction for rate sheets stuck in 'pending' or 'failed' status.
+    
+    This will:
+    1. Re-read the stored file
+    2. Re-parse the Excel data
+    3. Re-run AI extraction
+    4. Update the structured data
+    
+    Returns the updated rate sheet data.
+    """
+    try:
+        service = RateSheetService()
+        result = await service.reprocess_rate_sheet(
+            rate_sheet_id=rate_sheet_id,
+            organization_id=organization_id
+        )
+        
+        if not result:
+            raise HTTPException(status_code=404, detail="Rate sheet not found or not owned by this organization")
+        
+        return result
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error reprocessing rate sheet {rate_sheet_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error reprocessing rate sheet: {str(e)}")
+
+
+@router.post("/reprocess-all-pending", status_code=200)
+async def reprocess_all_pending(
+    organization_id: int = Query(...),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Reprocess ALL rate sheets in 'pending' or 'failed' status for an organization.
+    
+    This runs in the background and returns immediately with a list of rate sheets being reprocessed.
+    """
+    try:
+        from app.core.database import AsyncSessionLocal
+        from app.models import RateSheetStructuredData
+        from sqlalchemy import select, or_
+        
+        # Find all pending/failed rate sheets
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(RateSheetStructuredData).where(
+                    RateSheetStructuredData.organization_id == organization_id,
+                    or_(
+                        RateSheetStructuredData.status == 'pending',
+                        RateSheetStructuredData.status == 'failed'
+                    )
+                )
+            )
+            pending_sheets = result.scalars().all()
+        
+        if not pending_sheets:
+            return {
+                "message": "No pending or failed rate sheets to reprocess",
+                "count": 0,
+                "rate_sheet_ids": []
+            }
+        
+        # Queue background reprocessing for each
+        rate_sheet_ids = [sheet.rate_sheet_id for sheet in pending_sheets]
+        
+        for rate_sheet_id in rate_sheet_ids:
+            if background_tasks:
+                background_tasks.add_task(
+                    _reprocess_rate_sheet_background,
+                    rate_sheet_id,
+                    organization_id
+                )
+        
+        return {
+            "message": f"Queued {len(rate_sheet_ids)} rate sheets for reprocessing",
+            "count": len(rate_sheet_ids),
+            "rate_sheet_ids": rate_sheet_ids
+        }
+    
+    except Exception as e:
+        logger.error(f"Error queuing rate sheets for reprocessing: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error queuing reprocessing: {str(e)}")
+
+
+async def _reprocess_rate_sheet_background(rate_sheet_id: str, organization_id: int):
+    """Background task to reprocess a rate sheet"""
+    try:
+        service = RateSheetService()
+        await service.reprocess_rate_sheet(rate_sheet_id, organization_id)
+        logger.info(f"✅ Reprocessed rate sheet {rate_sheet_id}")
+    except Exception as e:
+        logger.error(f"❌ Failed to reprocess rate sheet {rate_sheet_id}: {e}")
+
+
+@router.post("/reprocess-all", status_code=200)
+async def reprocess_all_rate_sheets(
+    organization_id: int = Query(...)
+):
+    """
+    Reprocess ALL rate sheets for an organization with the improved AI extraction.
+    
+    This will:
+    1. Get all rate sheets from PostgreSQL
+    2. Re-run AI extraction on each file with improved prompts
+    3. Update the normalized tables with correct port names and pricing
+    
+    Use this after AI extraction improvements to fix previously extracted data.
+    
+    NOTE: This is a synchronous operation that may take several minutes.
+    """
+    try:
+        service = RateSheetService()
+        result = await service.reprocess_all_rate_sheets(organization_id=organization_id)
+        return result
+    except Exception as e:
+        logger.error(f"Error reprocessing all rate sheets: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error reprocessing rate sheets: {str(e)}")
+
+
+@router.post("/sync-chromadb", status_code=200)
+async def sync_rate_sheets_to_chromadb(
+    organization_id: int = Query(...)
+):
+    """
+    Sync all rate sheets from PostgreSQL to ChromaDB.
+    
+    This is useful when rate sheets exist in PostgreSQL but are missing from ChromaDB.
+    It will check each rate sheet and add it to ChromaDB if missing.
+    """
+    from app.core.database import AsyncSessionLocal
+    from app.models import RateSheetStructuredData
+    from sqlalchemy import select
+    from app.services.embedding_service import EmbeddingService
+    
+    try:
+        embedding_service = EmbeddingService()
+        
+        # Get all rate sheets from PostgreSQL
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(RateSheetStructuredData).where(
+                    RateSheetStructuredData.organization_id == organization_id,
+                    RateSheetStructuredData.status == 'processed'
+                )
+            )
+            rate_sheets = result.scalars().all()
+        
+        synced = 0
+        already_exists = 0
+        failed = 0
+        
+        for rs in rate_sheets:
+            try:
+                # Check if exists in ChromaDB
+                chromadb_doc = await embedding_service.get_rate_sheet_by_id(rs.rate_sheet_id)
+                if chromadb_doc:
+                    already_exists += 1
+                    continue
+                
+                # Build structured_data from JSONB columns
+                structured_data = {
+                    "routes": rs.routes_json or [],
+                    "pricing_tiers": rs.pricing_tiers_json or [],
+                    "surcharges": rs.surcharges_json or [],
+                    "additional_charges": rs.additional_charges or [],
+                    "carrier_name": rs.carrier_name or "",
+                    "rate_sheet_type": rs.rate_sheet_type or "ocean_freight",
+                    "title": rs.title or "",
+                    "validity": {
+                        "valid_from": rs.valid_from.isoformat() if rs.valid_from else None,
+                        "valid_to": rs.valid_to.isoformat() if rs.valid_to else None,
+                        "effective_date": rs.effective_date.isoformat() if rs.effective_date else None
+                    },
+                    "relationships": {
+                        "is_related": rs.is_related == "true",
+                        "relationship_type": rs.relationship_type or "",
+                        "related_to_rate_sheets": rs.related_rate_sheet_ids or []
+                    }
+                }
+                
+                # Not in ChromaDB - sync it
+                from datetime import datetime
+                now = datetime.utcnow()
+                metadata = {
+                    "organization_id": organization_id,
+                    "user_id": rs.user_id,
+                    "file_name": rs.file_name or "",
+                    "file_path": rs.file_path or "",
+                    "file_size_bytes": 0,
+                    "file_type": rs.file_name.split('.')[-1] if rs.file_name else "",
+                    "status": "processed",
+                    "created_at": rs.created_at.isoformat() if rs.created_at else now.isoformat(),
+                    "updated_at": now.isoformat(),
+                    "processed_at": now.isoformat(),
+                }
+                await embedding_service.store_rate_sheet(
+                    rate_sheet_id=rs.rate_sheet_id,
+                    rate_sheet_data=structured_data,
+                    parsed_data={},
+                    metadata=metadata
+                )
+                synced += 1
+                logger.info(f"✅ Synced {rs.rate_sheet_id} to ChromaDB")
+            except Exception as e:
+                failed += 1
+                logger.error(f"❌ Failed to sync {rs.rate_sheet_id}: {e}")
+        
+        return {
+            "message": f"ChromaDB sync complete",
+            "total": len(rate_sheets),
+            "synced": synced,
+            "already_exists": already_exists,
+            "failed": failed
+        }
+    except Exception as e:
+        logger.error(f"Error syncing to ChromaDB: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error syncing to ChromaDB: {str(e)}")

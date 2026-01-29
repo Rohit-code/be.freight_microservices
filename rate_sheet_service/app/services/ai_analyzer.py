@@ -1,3 +1,19 @@
+"""
+DEPRECATED: This module is deprecated in favor of rate_sheet_extractor.py
+
+The AIAnalyzer class has been renamed to RateSheetExtractor to better reflect
+its purpose: extraction, not reasoning.
+
+For backward compatibility, AIAnalyzer is aliased to RateSheetExtractor.
+Please update your imports:
+
+    # Old (deprecated):
+    from app.services.ai_analyzer import AIAnalyzer
+
+    # New (recommended):
+    from app.services.rate_sheet_extractor import RateSheetExtractor
+"""
+import warnings
 import httpx
 import json
 import logging
@@ -6,9 +22,24 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Emit deprecation warning on import
+warnings.warn(
+    "ai_analyzer module is deprecated. Use rate_sheet_extractor instead. "
+    "Import RateSheetExtractor from app.services.rate_sheet_extractor",
+    DeprecationWarning,
+    stacklevel=2
+)
+
 
 class AIAnalyzer:
-    """AI-powered analyzer for understanding rate sheet structure and relationships"""
+    """
+    DEPRECATED: Use RateSheetExtractor instead.
+    
+    AI-powered extractor for understanding rate sheet structure and relationships.
+    
+    This class is kept for backward compatibility. New code should use:
+        from app.services.rate_sheet_extractor import RateSheetExtractor
+    """
     
     def __init__(self):
         self.ai_service_url = settings.AI_SERVICE_URL
@@ -54,9 +85,23 @@ class AIAnalyzer:
                 result = response.json()
                 return result.get("analysis", {})
         
+        except httpx.ConnectError as e:
+            logger.error(f"Error calling AI service: Cannot connect to {self.ai_service_url} - {str(e) or 'Connection refused'}")
+            return self._fallback_analysis(parsed_data, file_name)
+        except httpx.TimeoutException as e:
+            logger.error(f"Error calling AI service: Request timeout after 60s - {str(e) or 'Request timed out'}")
+            return self._fallback_analysis(parsed_data, file_name)
+        except httpx.HTTPStatusError as e:
+            error_text = ""
+            try:
+                error_text = e.response.text[:200] if e.response else "No response"
+            except:
+                pass
+            logger.error(f"Error calling AI service: HTTP {e.response.status_code if e.response else 'Unknown'} - {error_text}")
+            return self._fallback_analysis(parsed_data, file_name)
         except Exception as e:
-            logger.error(f"Error calling AI service: {e}")
-            # Fallback to basic extraction
+            error_msg = str(e) if str(e) else f"{type(e).__name__} (no message)"
+            logger.error(f"Error calling AI service: {error_msg}", exc_info=True)
             return self._fallback_analysis(parsed_data, file_name)
     
     def _build_analysis_prompt(
@@ -268,12 +313,31 @@ Return JSON:
                 )
                 response.raise_for_status()
                 return response.json().get("relationships", {})
-        except Exception as e:
-            logger.error(f"Error detecting relationships: {e}")
+        except httpx.ConnectError as e:
+            logger.error(f"Error detecting relationships: Cannot connect to {self.ai_service_url} - {str(e) or 'Connection refused'}")
             return {
                 "is_related": False,
                 "relationship_type": "independent",
                 "related_to_rate_sheets": [],
                 "confidence_score": 0,
-                "reasoning": f"Error detecting relationships: {str(e)}"
+                "reasoning": f"AI service unavailable: Connection error"
+            }
+        except httpx.TimeoutException as e:
+            logger.error(f"Error detecting relationships: Request timeout - {str(e) or 'Request timed out'}")
+            return {
+                "is_related": False,
+                "relationship_type": "independent",
+                "related_to_rate_sheets": [],
+                "confidence_score": 0,
+                "reasoning": f"AI service unavailable: Request timeout"
+            }
+        except Exception as e:
+            error_msg = str(e) if str(e) else f"{type(e).__name__} (no message)"
+            logger.error(f"Error detecting relationships: {error_msg}", exc_info=True)
+            return {
+                "is_related": False,
+                "relationship_type": "independent",
+                "related_to_rate_sheets": [],
+                "confidence_score": 0,
+                "reasoning": f"Error detecting relationships: {error_msg}"
             }

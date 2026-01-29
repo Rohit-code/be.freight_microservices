@@ -39,18 +39,23 @@ except ImportError:
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events"""
     # Startup
-    if USE_SHARED_LOGGING:
-        log_service_startup(logger, "auth", 8001, "0.1.0")
-    else:
-        logger.info("🚀 Auth Service v0.1.0 - Port 8001")
-    
-    await init_db()
-    if USE_SHARED_LOGGING:
-        log_dependency_status(logger, "PostgreSQL", "ok")
-        log_service_ready(logger, "auth")
-    else:
-        logger.info("✅ PostgreSQL: ok")
-        logger.info("✅ Auth Service Ready")
+    try:
+        if USE_SHARED_LOGGING:
+            log_service_startup(logger, "auth", 8001, "0.1.0")
+        else:
+            logger.info("🚀 Auth Service v0.1.0 - Port 8001")
+        
+        await init_db()
+        if USE_SHARED_LOGGING:
+            log_dependency_status(logger, "PostgreSQL", "ok")
+            log_service_ready(logger, "auth")
+        else:
+            logger.info("✅ PostgreSQL: ok")
+            logger.info("✅ Auth Service Ready")
+    except Exception as e:
+        logger.error(f"❌ Failed to start Auth Service: {e}", exc_info=True)
+        # Don't raise - let the service start anyway (might be recoverable)
+        logger.warning("⚠️  Service starting despite errors - some features may not work")
     
     yield
     

@@ -15,12 +15,13 @@ if str(SHARED_PATH) not in sys.path:
     sys.path.insert(0, str(SHARED_PATH))
 
 try:
-    from constants import TIMEOUT_MEDIUM, TIMEOUT_LONG, TIMEOUT_WEBHOOK
+    from constants import TIMEOUT_MEDIUM, TIMEOUT_LONG, TIMEOUT_WEBHOOK, TIMEOUT_UPLOAD
 except ImportError:
     # Fallback if shared constants not available
     TIMEOUT_MEDIUM = 30.0
     TIMEOUT_LONG = 60.0
     TIMEOUT_WEBHOOK = 180.0
+    TIMEOUT_UPLOAD = 600.0  # 10 minutes for file uploads with AI processing and ChromaDB storage
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,16 @@ def _get_timeout(request: Request, default_timeout: float = TIMEOUT_LONG) -> flo
     # Webhook endpoints need longer timeout
     if "/gmail/webhook" in path:
         return TIMEOUT_WEBHOOK
+    
+    # File upload endpoints (rate sheets, etc.) need longer timeout for AI processing
+    if "/upload" in path or "/rate-sheets/upload" in path:
+        try:
+            from constants import TIMEOUT_UPLOAD
+            upload_timeout = TIMEOUT_UPLOAD
+        except ImportError:
+            upload_timeout = 600.0  # 10 minutes fallback for uploads with AI + ChromaDB
+        logger.info(f"Using upload timeout: {upload_timeout}s for path: {path}")
+        return upload_timeout
     
     return default_timeout
 
@@ -87,7 +98,8 @@ async def proxy_request(
         timeout = _get_timeout(request, default_timeout)
         
         # Make proxied request
-        async with httpx.AsyncClient(follow_redirects=follow_redirects) as client:
+        logger.info(f"Proxying {request.method} {target_url} with timeout={timeout}s")
+        async with httpx.AsyncClient(follow_redirects=follow_redirects, timeout=timeout) as client:
             try:
                 response = await client.request(
                     method=request.method,
@@ -122,9 +134,33 @@ async def proxy_request(
                 )
             except httpx.TimeoutException as e:
                 logger.error(f"Timeout connecting to {service_name} at {target_url}: {e}")
+                # For upload endpoints, the operation might have succeeded server-side
+                if "/upload" in str(request.url.path) or "/rate-sheets/upload" in str(request.url.path):
+                    raise HTTPException(
+                        status_code=504,  # Gateway Timeout (more appropriate than 503)
+                        detail=f"{service_name} request timed out. The upload may still be processing. Please check your rate sheets list."
+                    )
                 raise HTTPException(
                     status_code=503,
                     detail=f"{service_name} unavailable: Request timeout"
+                )
+            except httpx.ReadTimeout as e:
+                logger.error(f"Read timeout connecting to {service_name} at {target_url}: {e}")
+                # For upload endpoints, the operation might have succeeded server-side
+                if "/upload" in str(request.url.path) or "/rate-sheets/upload" in str(request.url.path):
+                    raise HTTPException(
+                        status_code=504,  # Gateway Timeout (more appropriate than 503)
+                        detail=f"{service_name} request timed out. The upload may still be processing. Please check your rate sheets list."
+                    )
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"{service_name} unavailable: Read timeout"
+                )
+            except httpx.ConnectTimeout as e:
+                logger.error(f"Connect timeout connecting to {service_name} at {target_url}: {e}")
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"{service_name} unavailable: Connection timeout"
                 )
                 
     except httpx.RequestError as e:

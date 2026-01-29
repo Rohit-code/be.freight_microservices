@@ -30,6 +30,13 @@ class User(Base):
     sheets_connected = Column(Boolean, default=False, nullable=False)
     docs_connected = Column(Boolean, default=False, nullable=False)
     
+    # Gmail watch tracking
+    last_processed_history_id = Column(String(50), nullable=True)  # Last processed Gmail historyId
+    
+    # Email drafting settings
+    email_drafting_enabled = Column(Boolean, default=False, nullable=False)  # Whether auto-drafting is enabled
+    email_drafting_enabled_at = Column(DateTime(timezone=True), nullable=True)  # When drafting was enabled (only draft emails after this time)
+    
     # Account status
     is_active = Column(Boolean, default=True, nullable=False)
     is_staff = Column(Boolean, default=False, nullable=False)

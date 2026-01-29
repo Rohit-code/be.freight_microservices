@@ -1277,6 +1277,35 @@ async def gmail_webhook_test_manual(request: Request):
         }
 
 
+@router.get("/gmail/webhook")
+async def gmail_webhook_verification(request: Request):
+    """
+    Webhook verification endpoint for Google Pub/Sub.
+    Google sends a GET request with challenge token to verify endpoint ownership.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    # Get challenge token from query parameters
+    challenge = request.query_params.get("challenge")
+    
+    logger.info("=" * 80)
+    logger.info("GMAIL WEBHOOK VERIFICATION (GET)")
+    logger.info(f"Request URL: {request.url}")
+    logger.info(f"Challenge token: {challenge}")
+    
+    if challenge:
+        # Return the challenge token to verify endpoint ownership
+        logger.info("✅ Returning challenge token for verification")
+        logger.info("=" * 80)
+        return Response(content=challenge, media_type="text/plain")
+    else:
+        # No challenge token - just return OK
+        logger.info("⚠️  No challenge token provided")
+        logger.info("=" * 80)
+        return {"status": "ok", "message": "Webhook endpoint is accessible"}
+
+
 @router.post("/gmail/webhook")
 async def gmail_webhook(request: Request):
     """
@@ -1287,12 +1316,13 @@ async def gmail_webhook(request: Request):
     import json
     import httpx
     import logging
+    from fastapi.responses import Response
     
     logger = logging.getLogger(__name__)
     
     # Log webhook received with full details
     logger.info("=" * 80)
-    logger.info("GMAIL WEBHOOK RECEIVED")
+    logger.info("GMAIL WEBHOOK RECEIVED (POST)")
     logger.info(f"Request method: {request.method}")
     logger.info(f"Request URL: {request.url}")
     logger.info(f"Request headers: {dict(request.headers)}")
@@ -1394,7 +1424,57 @@ async def start_gmail_watch(authorization: str = Header(default="")):
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to start Gmail watch: {str(e)}",
+            detail=str(e)
+        )
+
+
+@router.post("/email-drafting/enable")
+async def enable_email_drafting(authorization: str = Header(default="")):
+    """Enable email auto-drafting for the current user. Only emails received after this will be drafted."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authorization header missing or invalid",
+        )
+    
+    token = authorization.replace("Bearer ", "")
+    
+    try:
+        return await auth_service.enable_email_drafting(token)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@router.post("/email-drafting/disable")
+async def disable_email_drafting(authorization: str = Header(default="")):
+    """Disable email auto-drafting for the current user"""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authorization header missing or invalid",
+        )
+    
+    token = authorization.replace("Bearer ", "")
+    
+    try:
+        return await auth_service.disable_email_drafting(token)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
         )
 
 
@@ -1420,6 +1500,21 @@ async def stop_gmail_watch(authorization: str = Header(default="")):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to stop Gmail watch: {str(e)}",
+        )
+
+
+@router.get("/internal/user/{user_id}/drafting-status")
+async def internal_get_drafting_status(user_id: int):
+    """Internal API: Get email drafting status for a user by user_id."""
+    import logging
+    logger = logging.getLogger(__name__)
+    try:
+        return await auth_service.get_user_drafting_status(user_id)
+    except Exception as e:
+        logger.error(f"Error getting drafting status for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get drafting status: {str(e)}"
         )
 
 

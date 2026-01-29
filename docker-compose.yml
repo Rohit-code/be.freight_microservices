@@ -1,0 +1,477 @@
+# Freight Forwarder Microservices - Docker Compose
+# Usage:
+#   docker-compose up -d          # Start all services in background
+#   docker-compose down           # Stop all services
+#   docker-compose logs -f        # View logs
+#   docker-compose ps             # Check status
+
+services:
+  # =============================================================================
+  # DATABASES
+  # =============================================================================
+  
+  postgres:
+    image: postgres:15-alpine
+    container_name: freight_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_MULTIPLE_DATABASES: auth_service_db,rate_sheet_service_db,email_service_db,user_service_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-multiple-dbs.sh:/docker-entrypoint-initdb.d/init-multiple-dbs.sh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - freight_network
+
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: freight_chromadb
+    restart: unless-stopped
+    ports:
+      - "8500:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+    healthcheck:
+      # Chroma 1.0+ uses /api/v2/heartbeat; v1 returns 410 Gone
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8000/api/v2/heartbeat || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - freight_network
+
+  arangodb:
+    image: arangodb:latest
+    container_name: freight_arangodb
+    restart: unless-stopped
+    environment:
+      ARANGO_ROOT_PASSWORD: password
+    ports:
+      - "8529:8529"
+    volumes:
+      - arango_data:/var/lib/arangodb3
+    healthcheck:
+      test: ["CMD-SHELL", "arangosh --server.endpoint tcp://localhost:8529 --server.username root --server.password password --server.database _system --javascript.execute-string 'db._version()' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - freight_network
+
+  # =============================================================================
+  # CORE SERVICES
+  # =============================================================================
+  
+  authentication:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: authentication
+        PORT: 8001
+    container_name: freight_authentication
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - DB_NAME=auth_service_db
+      - USER_SERVICE_URL=http://user_service:8006
+      - EMAIL_SERVICE_URL=http://email_service:8005
+      - JWT_SECRET=${JWT_SECRET:-your-super-secret-jwt-key-change-in-production}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - GOOGLE_REDIRECT_URI=${GOOGLE_REDIRECT_URI:-http://localhost:8000/api/auth/google/callback}
+      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}
+      - GMAIL_PUBSUB_TOPIC=${GMAIL_PUBSUB_TOPIC}
+      - GMAIL_WEBHOOK_URL=${GMAIL_WEBHOOK_URL}
+      - PORT=8001
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - freight_network
+
+  constants:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: constants
+        PORT: 8002
+    container_name: freight_constants
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    environment:
+      - PORT=8002
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - freight_network
+
+  ai_service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: ai_service
+        PORT: 8003
+    container_name: freight_ai_service
+    restart: unless-stopped
+    ports:
+      - "8003:8003"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - PORT=8003
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - freight_network
+
+  vector_db:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: vector_db
+        PORT: 8004
+    container_name: freight_vector_db
+    restart: unless-stopped
+    ports:
+      - "8004:8004"
+    environment:
+      - CHROMA_DB_PATH=/app/chroma_data
+      - PORT=8004
+    volumes:
+      - vector_db_data:/app/chroma_data
+    # Run as root to ensure write permissions on volume, then switch to appuser
+    user: "0:0"
+    command: >
+      sh -c "
+      mkdir -p /app/chroma_data &&
+      chown -R 1000:1000 /app/chroma_data &&
+      chmod -R 755 /app/chroma_data &&
+      exec su appuser -c 'cd /app/vector_db && uvicorn app.main:app --host 0.0.0.0 --port 8004'
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - freight_network
+
+  email_service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: email_service
+        PORT: 8005
+    container_name: freight_email_service
+    restart: unless-stopped
+    ports:
+      - "8005:8005"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - DB_NAME=email_service_db
+      - VECTOR_DB_SERVICE_URL=http://vector_db:8004
+      - AI_SERVICE_URL=http://ai_service:8003
+      - AUTH_SERVICE_URL=http://authentication:8001
+      - RATE_SHEET_SERVICE_URL=http://rate_sheet_service:8010
+      - PORT=8005
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vector_db:
+        condition: service_started
+      ai_service:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - freight_network
+
+  user_service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: user_service
+        PORT: 8006
+    container_name: freight_user_service
+    restart: unless-stopped
+    ports:
+      - "8006:8006"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - DB_NAME=user_service_db
+      - AUTH_SERVICE_URL=http://authentication:8001
+      - PORT=8006
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - freight_network
+
+  # =============================================================================
+  # AGENTIC ARCHITECTURE SERVICES
+  # =============================================================================
+  
+  knowledge_graph_service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: knowledge_graph_service
+        PORT: 8011
+    container_name: freight_knowledge_graph
+    restart: unless-stopped
+    ports:
+      - "8011:8011"
+    environment:
+      - ARANGO_HOST=http://arangodb:8529
+      - ARANGO_USER=root
+      - ARANGO_PASSWORD=password
+      - ARANGO_DATABASE=freight_graph
+      - PORT=8011
+    depends_on:
+      arangodb:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8011/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - freight_network
+
+  intent_classifier_service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: intent_classifier_service
+        PORT: 8012
+    container_name: freight_intent_classifier
+    restart: unless-stopped
+    ports:
+      - "8012:8012"
+    environment:
+      - AI_SERVICE_URL=http://ai_service:8003
+      - PORT=8012
+    depends_on:
+      ai_service:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8012/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - freight_network
+
+  orchestrator_service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: orchestrator_service
+        PORT: 8013
+    container_name: freight_orchestrator
+    restart: unless-stopped
+    ports:
+      - "8013:8013"
+    environment:
+      - AI_SERVICE_URL=http://ai_service:8003
+      - VECTOR_DB_SERVICE_URL=http://vector_db:8004
+      - RATE_SHEET_SERVICE_URL=http://rate_sheet_service:8010
+      - INTENT_CLASSIFIER_SERVICE_URL=http://intent_classifier_service:8012
+      - KNOWLEDGE_GRAPH_SERVICE_URL=http://knowledge_graph_service:8011
+      - PORT=8013
+    depends_on:
+      ai_service:
+        condition: service_started
+      vector_db:
+        condition: service_started
+      intent_classifier_service:
+        condition: service_started
+      knowledge_graph_service:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8013/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - freight_network
+
+  decision_engine:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: decision_engine
+        PORT: 8014
+    container_name: freight_decision_engine
+    restart: unless-stopped
+    ports:
+      - "8014:8014"
+    environment:
+      - AI_SERVICE_URL=http://ai_service:8003
+      - PORT=8014
+    depends_on:
+      ai_service:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8014/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - freight_network
+
+  rate_sheet_service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: rate_sheet_service
+        PORT: 8010
+    container_name: freight_rate_sheet
+    restart: unless-stopped
+    ports:
+      - "8010:8010"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - AI_SERVICE_URL=http://ai_service:8003
+      - VECTOR_DB_SERVICE_URL=http://vector_db:8004
+      - KNOWLEDGE_GRAPH_SERVICE_URL=http://knowledge_graph_service:8011
+      - ORCHESTRATOR_SERVICE_URL=http://orchestrator_service:8013
+      - DECISION_ENGINE_SERVICE_URL=http://decision_engine:8014
+      - AUTH_SERVICE_URL=http://authentication:8001
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - PORT=8010
+    volumes:
+      - rate_sheet_uploads:/app/rate_sheet_service/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ai_service:
+        condition: service_started
+      vector_db:
+        condition: service_started
+      orchestrator_service:
+        condition: service_started
+      decision_engine:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8010/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - freight_network
+
+  # =============================================================================
+  # API GATEWAY (Entry Point)
+  # =============================================================================
+  
+  api_gateway:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: api_gateway
+        PORT: 8000
+    container_name: freight_api_gateway
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - AUTH_SERVICE_URL=http://authentication:8001
+      - CONSTANTS_SERVICE_URL=http://constants:8002
+      - AI_SERVICE_URL=http://ai_service:8003
+      - VECTOR_DB_SERVICE_URL=http://vector_db:8004
+      - EMAIL_SERVICE_URL=http://email_service:8005
+      - USER_SERVICE_URL=http://user_service:8006
+      - RATE_SHEET_SERVICE_URL=http://rate_sheet_service:8010
+      - KNOWLEDGE_GRAPH_SERVICE_URL=http://knowledge_graph_service:8011
+      - INTENT_CLASSIFIER_SERVICE_URL=http://intent_classifier_service:8012
+      - ORCHESTRATOR_SERVICE_URL=http://orchestrator_service:8013
+      - DECISION_ENGINE_SERVICE_URL=http://decision_engine:8014
+      - PORT=8000
+    depends_on:
+      - authentication
+      - constants
+      - ai_service
+      - vector_db
+      - email_service
+      - user_service
+      - rate_sheet_service
+      - knowledge_graph_service
+      - intent_classifier_service
+      - orchestrator_service
+      - decision_engine
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - freight_network
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  postgres_data:
+    driver: local
+  chroma_data:
+    driver: local
+  arango_data:
+    driver: local
+  vector_db_data:
+    driver: local
+  rate_sheet_uploads:
+    driver: local
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+networks:
+  freight_network:
+    driver: bridge

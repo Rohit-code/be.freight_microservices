@@ -34,8 +34,17 @@ async def get_db() -> AsyncSession:
 
 async def init_db():
     """Initialize database - create all tables"""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    import logging
+    logger = logging.getLogger(__name__)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("✅ Database tables initialized successfully")
+    except Exception as e:
+        logger.error(f"❌ Database initialization failed: {e}", exc_info=True)
+        # Don't raise - let the service start even if tables already exist
+        # This allows the service to run if tables were created manually or via migrations
+        logger.warning("⚠️  Continuing despite database initialization error (tables may already exist)")
 
 
 async def close_db():

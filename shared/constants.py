@@ -9,6 +9,7 @@ TIMEOUT_MEDIUM: Final[int] = 30
 TIMEOUT_LONG: Final[int] = 60
 TIMEOUT_VERY_LONG: Final[int] = 120
 TIMEOUT_WEBHOOK: Final[int] = 180  # For webhook endpoints that trigger long operations
+TIMEOUT_UPLOAD: Final[int] = 600  # 10 minutes for file uploads with AI processing and ChromaDB storage
 
 # Request limits
 DEFAULT_PAGE_SIZE: Final[int] = 20

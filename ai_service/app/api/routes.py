@@ -7,6 +7,7 @@ from ..services.ai_service import (
     generate_email_response,
     analyze_spreadsheet_data,
     analyze_document,
+    analyze_rate_sheet,
 )
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
@@ -55,11 +56,15 @@ async def ai_analyze_email(request: Request):
     subject = body_data.get('subject', '')
     from_sender = body_data.get('from', '')
     
+    # Use subject as content if content is empty (some emails are subject-only)
     if not email_content:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing required field: content",
-        )
+        if subject:
+            email_content = f"Subject: {subject}"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing required field: content or subject",
+            )
     
     analysis = analyze_email(email_content, subject, from_sender)
     return analysis
@@ -132,4 +137,40 @@ async def ai_analyze_document(request: Request):
         )
     
     analysis = analyze_document(content, title)
+    return analysis
+
+
+@router.post("/analyze-rate-sheet")
+async def ai_analyze_rate_sheet(request: Request):
+    """Analyze rate sheet with AI and extract structured data"""
+    if not is_ai_available():
+        raise HTTPException(
+            status_code=503,
+            detail="AI service is not configured",
+        )
+    
+    body_data = await request.json()
+    parsed_data = body_data.get('parsed_data', {})
+    file_name = body_data.get('file_name', '')
+    existing_rate_sheets = body_data.get('existing_rate_sheets', [])
+    prompt = body_data.get('prompt')
+    
+    if not parsed_data:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing required field: parsed_data",
+        )
+    
+    if not file_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing required field: file_name",
+        )
+    
+    analysis = analyze_rate_sheet(
+        parsed_data=parsed_data,
+        file_name=file_name,
+        existing_rate_sheets=existing_rate_sheets,
+        prompt=prompt
+    )
     return analysis
