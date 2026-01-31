@@ -214,7 +214,8 @@ async def get_rate_sheet(
     return rate_sheet
 
 
-@router.get("/")
+@router.get("", summary="List/search rate sheets (no trailing slash)")
+@router.get("/", summary="List/search rate sheets (with trailing slash)")
 async def list_rate_sheets(
     organization_id: int = Query(..., description="Organization ID (REQUIRED for multi-tenant isolation)"),
     query: Optional[str] = Query(None, description="Natural language search query"),
@@ -249,7 +250,7 @@ async def list_rate_sheets(
     
     # Check if search_result is a dict with answer and results, or just a list
     if isinstance(search_result, dict) and "results" in search_result:
-        # New format with answer
+        # New format with answer (agentic: may include intent, engines_used, exact_rates, route_alternatives)
         rate_sheets = search_result.get("results", [])
         answer = search_result.get("answer", "")
         total_found = search_result.get("total_found", len(rate_sheets))
@@ -261,7 +262,7 @@ async def list_rate_sheets(
         total_found = len(rate_sheets)
         total_returned = len(rate_sheets)
     
-    # Simple pagination (though we're already returning top 3, pagination is minimal)
+    # Simple pagination (though we're already returning top N, pagination is minimal)
     start = (page - 1) * limit
     end = start + limit
     paginated_sheets = rate_sheets[start:end]
@@ -276,6 +277,17 @@ async def list_rate_sheets(
     # Add answer if available
     if answer:
         response["answer"] = answer
+    
+    # Pass through agentic fields when present (rate sheet search via Orchestrator)
+    if isinstance(search_result, dict):
+        if search_result.get("intent") is not None:
+            response["intent"] = search_result["intent"]
+        if search_result.get("engines_used") is not None:
+            response["engines_used"] = search_result["engines_used"]
+        if search_result.get("exact_rates") is not None:
+            response["exact_rates"] = search_result["exact_rates"]
+        if search_result.get("route_alternatives") is not None:
+            response["route_alternatives"] = search_result["route_alternatives"]
     
     return response
 

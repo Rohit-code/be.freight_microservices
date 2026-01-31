@@ -382,6 +382,7 @@ services:
       - VECTOR_DB_SERVICE_URL=http://vector_db:8004
       - KNOWLEDGE_GRAPH_SERVICE_URL=http://knowledge_graph_service:8011
       - ORCHESTRATOR_SERVICE_URL=http://orchestrator_service:8013
+      - INTENT_CLASSIFIER_SERVICE_URL=http://intent_classifier_service:8012
       - DECISION_ENGINE_SERVICE_URL=http://decision_engine:8014
       - AUTH_SERVICE_URL=http://authentication:8001
       - OPENAI_API_KEY=${OPENAI_API_KEY}
@@ -394,6 +395,8 @@ services:
       ai_service:
         condition: service_started
       vector_db:
+        condition: service_started
+      intent_classifier_service:
         condition: service_started
       orchestrator_service:
         condition: service_started

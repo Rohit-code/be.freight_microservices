@@ -2,6 +2,7 @@
 Agent Orchestrator Service
 Coordinates SQL, Graph, and Vector retrieval engines based on query intent
 """
+import asyncio
 import logging
 import httpx
 from typing import Dict, Any, List, Optional
@@ -49,73 +50,33 @@ class AgentOrchestrator:
             print(f"⏱️ [ORCHESTRATOR] Intent classification completed in {intent_time:.2f}s")
             logger.info(f"⏱️ [ORCHESTRATOR] Intent classification completed in {intent_time:.2f}s")
             
-            # Step 2: Route to appropriate engines
-            results = {
-                "intent": intent_result,
-                "sql_results": [],
-                "graph_results": [],
-                "vector_results": []
-            }
-            
-            # SQL Retrieval (exact rates) - always run for rate inquiries
+            # Step 2: Run SQL, Graph, Vector in parallel (latency reduction)
             intent_type = intent_result.get("intent", "")
             is_pricing_intent = intent_type in ["rate_inquiry", "rate_request", "quote_request", "pricing_inquiry"]
-            
-            if intent_result.get("requires_structured_data", False) or is_pricing_intent:
-                sql_start = time.time()
-                sql_results = await self._sql_retrieval(
-                    organization_id=organization_id,
-                    entities=intent_result.get("entities", {})
-                )
-                results["sql_results"] = sql_results
-                sql_time = time.time() - sql_start
-                print(f"⏱️ [ORCHESTRATOR] SQL retrieval completed in {sql_time:.2f}s, found {len(sql_results)} results")
-                logger.info(f"⏱️ [ORCHESTRATOR] SQL retrieval completed in {sql_time:.2f}s, found {len(sql_results)} results")
-            
-            # Graph Traversal (lane logic, alternatives) - run if we have port info
             entities = intent_result.get("entities", {})
-            if intent_result.get("requires_graph_traversal", False) or \
-               (entities.get("origin_port") and entities.get("destination_port")):
-                graph_start = time.time()
-                graph_results = await self._graph_retrieval(
-                    organization_id=organization_id,
-                    entities=entities
-                )
-                results["graph_results"] = graph_results
-                graph_time = time.time() - graph_start
-                print(f"⏱️ [ORCHESTRATOR] Graph retrieval completed in {graph_time:.2f}s, found {len(graph_results)} results")
-                logger.info(f"⏱️ [ORCHESTRATOR] Graph retrieval completed in {graph_time:.2f}s, found {len(graph_results)} results")
+            run_sql = intent_result.get("requires_structured_data", False) or is_pricing_intent
+            run_graph = intent_result.get("requires_graph_traversal", False) or (bool(entities.get("origin_port") and entities.get("destination_port")))
+            run_vector = intent_result.get("requires_vector_search", True) or is_pricing_intent
             
-            # Vector Retrieval (semantic context) - PRIMARY SOURCE, ALWAYS run for pricing intents
-            # ChromaDB contains COMPLETE sheet data - this is the MAIN source of truth
-            # Semantic context is CRITICAL for crafting accurate responses
-            if intent_result.get("requires_vector_search", True) or is_pricing_intent:
-                vector_start = time.time()
-                print(f"\n🔍 [ORCHESTRATOR] Running ChromaDB Vector Search (PRIMARY source)...")
-                print(f"   - Organization ID: {organization_id}")
-                print(f"   - Query: {email_content[:200]}...")
-                logger.info(f"🔍 [ORCHESTRATOR] Running ChromaDB Vector Search (PRIMARY source) for org_id={organization_id}")
-                vector_results = await self._vector_retrieval(
-                    organization_id=organization_id,
-                    query=email_content
-                )
-                results["vector_results"] = vector_results
-                vector_time = time.time() - vector_start
-                print(f"   ✅ ChromaDB Vector Search returned {len(vector_results)} rate sheets in {vector_time:.2f}s")
-                logger.info(f"✅ [ORCHESTRATOR] ChromaDB Vector Search returned {len(vector_results)} rate sheets in {vector_time:.2f}s (PRIMARY source)")
-                
-                # Log details of vector results
-                if vector_results:
-                    print(f"   📊 Vector results details:")
-                    for idx, result in enumerate(vector_results[:3], 1):
-                        if isinstance(result, dict):
-                            content_preview = result.get("content", result.get("document", ""))[:200] if isinstance(result.get("content", ""), str) else str(result.get("content", ""))[:200]
-                            print(f"      Result {idx}: content_length={len(str(result.get('content', '')))}, preview: {content_preview}...")
-                            logger.debug(f"      Result {idx}: {content_preview}...")
-                        else:
-                            preview = str(result)[:200]
-                            print(f"      Result {idx}: {preview}...")
-                            logger.debug(f"      Result {idx}: {preview}...")
+            async def _sql():
+                return await self._sql_retrieval(organization_id=organization_id, entities=entities) if run_sql else []
+            async def _graph():
+                return await self._graph_retrieval(organization_id=organization_id, entities=entities) if run_graph else []
+            async def _vector():
+                return await self._vector_retrieval(organization_id=organization_id, query=email_content) if run_vector else []
+            
+            retrieval_start = time.time()
+            sql_results, graph_results, vector_results = await asyncio.gather(_sql(), _graph(), _vector())
+            retrieval_time = time.time() - retrieval_start
+            print(f"⏱️ [ORCHESTRATOR] SQL+Graph+Vector (parallel) completed in {retrieval_time:.2f}s")
+            logger.info(f"⏱️ [ORCHESTRATOR] Parallel retrieval: sql={len(sql_results)}, graph={len(graph_results)}, vector={len(vector_results)} in {retrieval_time:.2f}s")
+            
+            results = {
+                "intent": intent_result,
+                "sql_results": sql_results,
+                "graph_results": graph_results,
+                "vector_results": vector_results
+            }
             
             # Step 3: Combine and rank results
             combined_results = self._combine_results(results)
@@ -332,6 +293,7 @@ class AgentOrchestrator:
                 
                 # ChromaDB returns nested structure: results.documents is a list of lists
                 results = result.get("results", {})
+                ids = results.get("ids", [[]])[0] if results.get("ids") else []
                 documents = results.get("documents", [[]])[0] if results.get("documents") else []
                 metadatas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
                 
@@ -345,10 +307,11 @@ class AgentOrchestrator:
                     print(f"      Document {idx} preview (first 300 chars): {doc_preview}")
                     logger.debug(f"      Document {idx} preview: {doc_preview}")
                 
-                # Combine documents with their metadata for context
+                # Combine documents with their metadata and id for context (id needed for rate sheet search)
                 combined = []
                 for i, doc in enumerate(documents):
                     combined.append({
+                        "id": ids[i] if i < len(ids) else None,
                         "content": doc,
                         "metadata": metadatas[i] if i < len(metadatas) else {}
                     })

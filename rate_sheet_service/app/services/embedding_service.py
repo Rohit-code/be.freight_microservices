@@ -421,76 +421,82 @@ class EmbeddingService:
         Returns:
             List of rate sheets with similarity scores (filtered by organization_id)
         """
-        try:
-            # Validate organization_id is provided
-            if not organization_id:
-                logger.error("organization_id is required for rate sheet search (multi-tenant isolation)")
-                raise ValueError("organization_id is required for data isolation")
-            
-            await self.ensure_collection_exists()
-            
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                # Query ChromaDB (currently doesn't support where filters, so we filter post-query)
-                # Note: Vector DB service currently uses post-query filtering
-                # Future enhancement: Add where filters directly to vector DB query for better performance
-                # Optimize: Request only what we need (limit) instead of limit * 3 to reduce computation
-                # Only request more if we have filters that might filter out results
-                n_results = limit * 3 if filters else limit
-                response = await client.post(
-                    f"{self.vector_db_service_url}/api/vector/collections/{RATE_SHEETS_COLLECTION}/query",
-                    json={
-                        "query_texts": [query],
-                        "n_results": n_results
-                    },
-                    timeout=30.0
-                )
-                response.raise_for_status()
-                result = response.json()
+        # Validate organization_id is provided
+        if not organization_id:
+            logger.error("organization_id is required for rate sheet search (multi-tenant isolation)")
+            raise ValueError("organization_id is required for data isolation")
+        
+        last_error = None
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                await self.ensure_collection_exists()
                 
-                # Format results similar to email service
-                results = result.get("results", {})
-                ids = results.get("ids", [[]])[0]
-                documents = results.get("documents", [[]])[0]
-                metadatas = results.get("metadatas", [[]])[0]
-                distances = results.get("distances", [[]])[0]
-                
-                # CRITICAL: Filter by organization_id FIRST for multi-tenant isolation
-                # This ensures users can ONLY see rate sheets from their own organization
-                filtered_results = []
-                for doc_id, doc, meta, dist in zip(ids, documents, metadatas, distances):
-                    # SECURITY: Enforce organization isolation - skip if organization_id doesn't match
-                    meta_org_id = meta.get("organization_id")
-                    if meta_org_id != str(organization_id):
-                        logger.debug(f"Skipping rate sheet {doc_id} - organization_id mismatch: {meta_org_id} != {organization_id}")
-                        continue
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    # Query ChromaDB (currently doesn't support where filters, so we filter post-query)
+                    n_results = limit * 3 if filters else limit
+                    response = await client.post(
+                        f"{self.vector_db_service_url}/api/vector/collections/{RATE_SHEETS_COLLECTION}/query",
+                        json={
+                            "query_texts": [query],
+                            "n_results": n_results
+                        },
+                        timeout=30.0
+                    )
+                    response.raise_for_status()
+                    result = response.json()
                     
-                    # Apply additional filters if provided
-                    if filters:
-                        skip = False
-                        for key, value in filters.items():
-                            if meta.get(key) != str(value):
-                                skip = True
-                                break
-                        if skip:
+                    results = result.get("results", {})
+                    ids = results.get("ids", [[]])[0]
+                    documents = results.get("documents", [[]])[0]
+                    metadatas = results.get("metadatas", [[]])[0]
+                    distances = results.get("distances", [[]])[0]
+                    
+                    filtered_results = []
+                    for doc_id, doc, meta, dist in zip(ids, documents, metadatas, distances):
+                        meta_org_id = meta.get("organization_id")
+                        if meta_org_id != str(organization_id):
                             continue
+                        if filters:
+                            skip = False
+                            for key, value in filters.items():
+                                if meta.get(key) != str(value):
+                                    skip = True
+                                    break
+                            if skip:
+                                continue
+                        filtered_results.append({
+                            "id": doc_id,
+                            "document": doc,
+                            "metadata": meta,
+                            "distance": dist,
+                            "similarity": 1 - dist
+                        })
+                        if len(filtered_results) >= limit:
+                            break
                     
-                    filtered_results.append({
-                        "id": doc_id,
-                        "document": doc,
-                        "metadata": meta,
-                        "distance": dist,
-                        "similarity": 1 - dist  # Convert distance to similarity
-                    })
-                    
-                    # Stop once we have enough results
-                    if len(filtered_results) >= limit:
-                        break
-                
-                logger.info(f"Search returned {len(filtered_results)} rate sheets for organization_id={organization_id} (filtered from {len(ids)} total results)")
-                return filtered_results
-        except Exception as e:
-            logger.error(f"Error searching rate sheets for organization_id={organization_id}: {e}")
-            return []
+                    logger.info(f"Search returned {len(filtered_results)} rate sheets for organization_id={organization_id} (filtered from {len(ids)} total results)")
+                    return filtered_results
+            except Exception as e:
+                last_error = e
+                err_msg = str(e).strip() or repr(e)
+                err_type = type(e).__name__
+                logger.warning(
+                    f"Search rate sheets attempt {attempt + 1}/{max_retries} failed for organization_id={organization_id}: "
+                    f"{err_type}: {err_msg}"
+                )
+                if attempt < max_retries - 1:
+                    delay = 1.5 * (attempt + 1)
+                    print(f"[EMBEDDING] First-call failure (attempt {attempt + 1}/{max_retries}): {err_type}: {err_msg}. Retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                    continue
+                logger.error(
+                    f"Error searching rate sheets for organization_id={organization_id} after {max_retries} attempts: "
+                    f"{err_type}: {err_msg}",
+                    exc_info=True
+                )
+                return []
+        return []
     
     async def get_rate_sheet_by_id(self, rate_sheet_id: str) -> Optional[Dict[str, Any]]:
         """Get rate sheet by ID from ChromaDB"""

@@ -92,6 +92,13 @@ Classify the intent:
    - cargo_type: Type of cargo
    - Use null for any entity NOT mentioned in the email
 
+4. **Answer preferences** (how to format the reply when returning rate sheet data):
+   - answer_format: "list" if they want a list of routes/costs (e.g. "give me routes and costing", "list all routes"); "short" if they want 1-3 lines (e.g. "how much", "price"); "long" only if they explicitly ask to "explain", "compare", "how to", "why", "walkthrough", "detailed"
+   - include_validity: true if they mention "validity", "valid dates", "valid from", "valid to", "with validity"
+   - container_filter: "20'" ONLY if they explicitly ask for 20-foot/20ft/20' ONLY; "40'" ONLY if they ask for 40-foot/40ft/40' ONLY; null if they ask for "container sizes", "what container you have", "all containers", or both/unspecified
+   - list_all_routes: true if they say "all routes", "every route", "provide all", "list all", "all the routes"
+   - sort_alphabetically: true if they say "sorted", "alphabetical", "alphabetically", "in order"
+
 Return ONLY valid JSON:
 {{
     "intent": "general",
@@ -109,7 +116,14 @@ Return ONLY valid JSON:
     "query_type": "fuzzy_match",
     "requires_structured_data": false,
     "requires_vector_search": false,
-    "requires_graph_traversal": false
+    "requires_graph_traversal": false,
+    "answer_preferences": {{
+        "answer_format": "list",
+        "include_validity": false,
+        "container_filter": null,
+        "list_all_routes": false,
+        "sort_alphabetically": false
+    }}
 }}"""
 
             # Call AI service
@@ -136,6 +150,13 @@ Return ONLY valid JSON:
                     if json_start >= 0 and json_end > json_start:
                         json_str = content[json_start:json_end]
                         classification = json.loads(json_str)
+                        ap = classification.get("answer_preferences") or {}
+                        ap.setdefault("answer_format", "list")
+                        ap.setdefault("include_validity", False)
+                        ap.setdefault("container_filter", None)
+                        ap.setdefault("list_all_routes", False)
+                        ap.setdefault("sort_alphabetically", False)
+                        classification["answer_preferences"] = ap
                     else:
                         # Fallback: basic classification
                         classification = self._fallback_classification(email_content, subject)
@@ -196,6 +217,25 @@ Return ONLY valid JSON:
                     elif "to" in content_lower:
                         entities["destination_port"] = keyword.upper()
         
+        # Answer preferences from keywords
+        ap = {"answer_format": "short", "include_validity": False, "container_filter": None, "list_all_routes": False, "sort_alphabetically": False}
+        if any(w in content_lower for w in ["list all", "all routes", "every route", "provide all", "all the routes"]):
+            ap["list_all_routes"] = True
+            ap["answer_format"] = "list"
+        if any(w in content_lower for w in ["validity", "valid dates", "valid from", "valid to", "with validity"]):
+            ap["include_validity"] = True
+        if any(w in content_lower for w in ["sorted", "alphabetical", "alphabetically", "in order"]):
+            ap["sort_alphabetically"] = True
+        # Only filter to one container type if they explicitly ask for "20 foot" or "40 foot" only (not "container sizes" or "what container")
+        if any(w in content_lower for w in ["container sizes", "container size", "what container", "all container"]):
+            ap["container_filter"] = None  # show both 20' and 40'
+        elif "20" in content_lower and ("foot" in content_lower or "ft" in content_lower or "20'" in content_lower) and "40" not in content_lower:
+            ap["container_filter"] = "20'"
+        elif "40" in content_lower and ("foot" in content_lower or "ft" in content_lower or "40'" in content_lower) and "20" not in content_lower:
+            ap["container_filter"] = "40'"
+        if any(w in content_lower for w in ["routes", "routing", "costing", "costs", "rates"]) and not any(w in content_lower for w in ["explain", "how to", "why ", "compare", "detailed"]):
+            ap["answer_format"] = "list"
+
         return {
             "intent": intent,
             "confidence": confidence,
@@ -203,5 +243,6 @@ Return ONLY valid JSON:
             "query_type": "fuzzy_match",
             "requires_structured_data": intent == "rate_inquiry" and freight_context,
             "requires_vector_search": freight_context,
-            "requires_graph_traversal": False
+            "requires_graph_traversal": False,
+            "answer_preferences": ap
         }

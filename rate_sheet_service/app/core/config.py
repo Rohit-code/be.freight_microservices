@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     # Orchestrator Service Configuration (NEW)
     ORCHESTRATOR_SERVICE_URL: str = "http://localhost:8013"
     
+    # Intent Classifier (for answer_preferences when not using orchestrator)
+    INTENT_CLASSIFIER_SERVICE_URL: str = "http://localhost:8012"
+    
     # Decision Engine Configuration (NEW)
     DECISION_ENGINE_SERVICE_URL: str = "http://localhost:8014"
     

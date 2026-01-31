@@ -348,17 +348,13 @@ Return the JSON response now:"""
     async def generate_answer(
         self,
         query: str,
-        results: List[Dict[str, Any]]
+        results: List[Dict[str, Any]],
+        answer_style: str = "auto",
+        intent_result: Optional[Dict[str, Any]] = None
     ) -> str:
         """
-        Generate a direct answer to the user's query based on the rate sheet results
-        
-        Args:
-            query: User's question/query
-            results: Top ranked rate sheet results
-            
-        Returns:
-            Direct answer extracted from the rate sheets
+        Generate a direct answer from rate sheet data. Uses intent (orchestrator/intent_classifier)
+        when provided so the AI gets one clear instruction; otherwise falls back to answer_style.
         """
         if not is_openai_available():
             logger.warning("OpenAI not available, cannot generate answer")
@@ -367,6 +363,22 @@ Return the JSON response now:"""
         if not results:
             return "No relevant rate sheets found to answer your query."
         
+        # Use only intent.answer_preferences (from orchestrator/intent_classifier). No hardcoded query parsing here.
+        prefs = (intent_result or {}).get("answer_preferences") or {}
+        try:
+            style = (prefs.get("answer_format") or answer_style or "auto").lower()
+            use_list = style == "list"
+            use_short = style == "short" or use_list
+            include_validity = bool(prefs.get("include_validity"))
+            container_filter = prefs.get("container_filter")
+            list_all_routes = bool(prefs.get("list_all_routes"))
+            sort_alphabetically = bool(prefs.get("sort_alphabetically"))
+        except Exception:
+            use_list = use_short = False
+            include_validity = list_all_routes = sort_alphabetically = False
+            container_filter = None
+        print(f"[GENERATE_ANSWER] style={style} use_list={use_list} use_short={use_short} include_validity={include_validity} container_filter={container_filter} list_all_routes={list_all_routes} sort_alphabetically={sort_alphabetically} (intent={'yes' if intent_result else 'no'})")
+
         try:
             # Prepare content from results for answer generation
             results_content = []
@@ -383,14 +395,18 @@ Return the JSON response now:"""
                 title = metadata.get('title', 'N/A')
                 carrier = metadata.get('carrier_name', 'N/A')
                 rate_type = metadata.get('rate_sheet_type', 'N/A')
+                valid_from = (metadata.get('valid_from') or '').strip()
+                valid_to = (metadata.get('valid_to') or '').strip()
+                validity_line = f"Valid: {valid_from} to {valid_to}\n" if (valid_from or valid_to) else ""
                 
-                # Build structured result info
+                # Build structured result info. Clarify: origin = port (from route lines), carrier = shipping line.
                 result_info = f"""Rate Sheet {idx}: {file_name}
-Carrier: {carrier}
+Carrier (shipping line): {carrier} | Origin PORT is in route lines below, NOT the carrier name.
 Title: {title}
 Type: {rate_type}
+{validity_line}
 
-Key Rate Information:
+Key Rate Information (each route shows origin PORT → destination):
 """
                 
                 # Extract structured matching rows with relevant data
@@ -413,47 +429,83 @@ Key Rate Information:
                             if clean_content:
                                 result_info += f"  • {clean_content}\n"
                 
-                # Add comprehensive document context for deep explanations
-                if full_document:
+                # When intent says list_all_routes: include full document so model can list every route (no hardcoded query check)
+                if use_short and full_document and list_all_routes:
+                    result_info += "\nFull route list (list every route from this data):\n"
+                    result_info += full_document[:14000] if len(full_document) > 14000 else full_document
+                    result_info += "\n"
+                
+                # For long answer only: add comprehensive document context
+                if not use_short and full_document:
                     # Extract more comprehensive context for detailed explanations
                     doc_lines = full_document.split('\n')
-                    
-                    # Extract structured sections (routes, pricing tiers, surcharges, etc.)
                     structured_sections = []
-                    current_section = None
-                    
-                    for line in doc_lines[:200]:  # Process more lines for comprehensive context
+                    for line in doc_lines[:200]:
                         line_lower = line.lower().strip()
-                        
-                        # Identify section headers
                         if any(keyword in line_lower for keyword in ['route', 'pricing', 'surcharge', 'container', 'port', 'origin', 'destination', 'validity', 'carrier']):
                             if line.strip():
                                 structured_sections.append(f"Section: {line.strip()[:150]}")
-                        
-                        # Extract data rows with key information
                         if any(keyword in line_lower for keyword in 
                                ['route', 'port', 'container', 'price', 'rate', 'origin', 'destination', 
                                 'transit', 'detention', 'free', 'surcharge', 'currency', 'valid', 'effective']):
                             clean_line = line.strip()
-                            if clean_line and len(clean_line) > 10:  # Skip very short lines
+                            if clean_line and len(clean_line) > 10:
                                 structured_sections.append(clean_line[:250])
-                    
                     if structured_sections:
                         result_info += f"\nComplete Rate Sheet Structure:\n"
-                        # Include more lines for comprehensive understanding
-                        for section in structured_sections[:25]:  # Top 25 relevant sections
+                        for section in structured_sections[:25]:
                             if section:
                                 result_info += f"  • {section}\n"
-                    
-                    # Add document length info for context
-                    doc_length = len(full_document)
-                    if doc_length > 1000:
-                        result_info += f"\nNote: This rate sheet contains {doc_length} characters of detailed information including routes, pricing tiers, surcharges, and operational details.\n"
+                    if len(full_document) > 1000:
+                        result_info += f"\nNote: This rate sheet contains {len(full_document)} characters of detailed information.\n"
                 
                 results_content.append(result_info)
             
-            # Build prompt for answer generation
-            prompt = f"""You are an expert freight forwarding consultant and trainer with 15+ years of experience. A user has asked a question about rate sheets, and you have access to relevant rate sheet data.
+            if use_list:
+                # One instruction block from intent (orchestrator/intent_classifier). No if/else on query.
+                instructions = [
+                    "Use ORIGIN PORT from the route data (e.g. PORT KLANG, LAEM CHABANG). Do NOT use carrier name (e.g. MAXICON) as origin.",
+                    "Output ONLY a compact list. Each line: origin PORT → destination (container): cost. No essays, no overviews.",
+                ]
+                if container_filter == "20'":
+                    instructions.append("Filter to 20' only. Label each line (20'). Do not include 40' rates.")
+                elif container_filter == "40'":
+                    instructions.append("Filter to 40' only. Label each line (40'). Do not include 20' rates.")
+                else:
+                    instructions.append("Include BOTH 20' and 40' rates for each route where available. Label each line (20') or (40'). Do not omit 40' when the data has it.")
+                if sort_alphabetically:
+                    instructions.append("Sort the list alphabetically: first by origin port (A–Z), then by destination port (A–Z).")
+                if list_all_routes:
+                    instructions.append("List EVERY route in the data (all origins, all destinations). Do not show only one destination. No sampling.")
+                else:
+                    instructions.append("Show ONE line per route (one rate per origin–destination–container). Do not list the same route multiple times with different costs.")
+                if include_validity:
+                    instructions.append("Include validity (Valid From – Valid To) on every line. Format: origin → destination (20'): cost | Valid: from–to.")
+                instruction_block = " ".join(instructions)
+                content_slice = results_content[:10] if list_all_routes else results_content[:5]
+                max_tokens = 1200 if list_all_routes else 350
+                prompt = f"""User query: "{query}"
+
+Rate sheet data (unified; do not refer to "Rate Sheet 1" or sheet-wise):
+{chr(10).join(content_slice)}
+
+Format instructions (follow exactly): {instruction_block}
+
+Output: compact list only. Follow any specific request in the user query (e.g. sorted, validity, 20' only, 40' only, all routes). FORBIDDEN: "Overview", "Understanding", "Conclusion", using carrier name as origin."""
+                system_content = "You output only a list of routes and costs from the data. Follow the format instructions and the user's request (sorting, validity, container type, etc.). Use origin port never carrier name. No intros, no conclusions."
+            elif use_short:
+                # Short: one place data, very concise. Only the direct answer.
+                prompt = f"""Query: "{query}"
+
+Data (unified; do not say 'Rate Sheet 1' or sheet-wise):
+{chr(10).join(results_content[:3])}
+
+Reply in 1-3 lines only. Give the exact data asked (routes/costs or one number). No overview, no "Understanding", no conclusion, no sheet-by-sheet breakdown."""
+                max_tokens = 120
+                system_content = "You give only the direct, concise answer from the data. One place. No sheet-wise breakdown, no overviews, no educational content. Maximum 1-3 short lines."
+            else:
+                # Long answer: detailed (existing prompt)
+                prompt = f"""You are an expert freight forwarding consultant and trainer with 15+ years of experience. A user has asked a question about rate sheets, and you have access to relevant rate sheet data.
 
 User Question: "{query}"
 
@@ -519,29 +571,27 @@ STYLE GUIDELINES:
 - Make it practical and actionable
 - Don't oversimplify - provide the depth they're asking for
 
-If the question asks for explanations or walkthroughs, provide extensive detail. If they say "I don't know anything" or "explain to me", treat it as a request for comprehensive education, not a quick overview.
+Use this long format ONLY because the user explicitly asked to explain, compare, or understand in depth. If they had asked only for data/routes/costs, you would have replied in 1-3 lines.
 
 Provide your comprehensive, in-depth answer now:"""
+                max_tokens = 800
+                system_content = "You are an expert freight forwarding consultant and trainer with 15+ years of industry experience. You provide comprehensive, in-depth, and highly detailed explanations based on rate sheet data. You excel at teaching complex concepts, providing step-by-step walkthroughs, and explaining the business context behind technical information. You synthesize information from multiple sources and present it in a professional, educational format that helps users become proficient. You provide extensive detail when questions ask for explanations, walkthroughs, or understanding - never oversimplify or provide only basic information when depth is requested."
             
             # Call OpenAI API to generate answer
             import asyncio
-            logger.info(f"Generating answer for query: '{query[:50]}...'")
+            out_style = "list" if use_list else "short" if use_short else "long"
+            print(f"[GENERATE_ANSWER] Calling OpenAI for {out_style} answer (max_tokens see prompt)")
+            logger.info(f"Generating answer for query: '{query[:50]}...' (style={out_style})")
             
             response = await asyncio.to_thread(
                 self.client.chat.completions.create,
                 model="gpt-4o-mini",
                 messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert freight forwarding consultant and trainer with 15+ years of industry experience. You provide comprehensive, in-depth, and highly detailed explanations based on rate sheet data. You excel at teaching complex concepts, providing step-by-step walkthroughs, and explaining the business context behind technical information. You synthesize information from multiple sources and present it in a professional, educational format that helps users become proficient. You provide extensive detail when questions ask for explanations, walkthroughs, or understanding - never oversimplify or provide only basic information when depth is requested."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
+                    {"role": "system", "content": system_content},
+                    {"role": "user", "content": prompt}
                 ],
-                temperature=0.7,
-                max_tokens=2500
+                temperature=0.3 if use_short else 0.7,
+                max_tokens=max_tokens
             )
             
             answer = response.choices[0].message.content.strip()

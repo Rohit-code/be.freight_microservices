@@ -15,6 +15,7 @@ import uuid
 import logging
 import numpy as np
 import hashlib
+import httpx
 
 from app.services.excel_parser import ExcelParser
 from app.services.rate_sheet_extractor import RateSheetExtractor
@@ -697,6 +698,106 @@ class RateSheetService:
             logger.error(f"Error getting rate sheet {rate_sheet_id} for organization_id={organization_id}: {e}")
             return None
     
+    @staticmethod
+    def _is_simple_query(
+        query: Optional[str],
+        origin_code: Optional[str],
+        destination_code: Optional[str],
+        container_type: Optional[str]
+    ) -> bool:
+        """True if query is 1-6 words and no route/container filters → vector-only, no orchestrator, short answer (low latency)."""
+        if not query or not query.strip():
+            return False
+        words = len(query.strip().split())
+        if words > 6:
+            return False
+        if origin_code or destination_code or container_type:
+            return False
+        return True
+
+    @staticmethod
+    def _is_list_or_fact_query(query: Optional[str]) -> bool:
+        """True if user wants a list of routes/costs or a direct fact, not an essay. Used to force short answer and skip orchestrator."""
+        if not query or not query.strip():
+            return False
+        q = query.lower().strip()
+        list_fact_phrases = (
+            "what route", "which route", "what routes", "which routes", "list ", "list the",
+            "costs of", "costs for", "cost of", "cost for", "routes and cost", "routes and costs",
+            "routes has", "routes have", "tell me what route", "tell me what routes",
+            "price for", "price of", "prices for", "40 foot", "40-foot", "20 foot", "20-foot"
+        )
+        return any(p in q for p in list_fact_phrases)
+
+    @staticmethod
+    def _has_long_answer_keywords(query: Optional[str]) -> bool:
+        """True if query explicitly asks for explanation/detail/compare (long answer)."""
+        if not query or not query.strip():
+            return False
+        q = query.lower().strip()
+        long_keywords = (
+            "explain", "detail", "details", "breakdown", "compare", "how to", "how do", "how does", "how can",
+            "why ", "walkthrough", "comprehensive", "full ", "alternatives", "options", "difference", "versus", "vs "
+        )
+        if "how much" in q or "how many" in q:
+            return False
+        return any(k in q for k in long_keywords)
+
+    async def _get_intent_for_query(self, query: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Call intent classifier to get intent + answer_preferences. Used when we don't have orchestrator intent."""
+        if not query or not query.strip():
+            print("[INTENT] No query → skip intent classifier")
+            return None
+        try:
+            print(f"[INTENT] Calling intent classifier: {settings.INTENT_CLASSIFIER_SERVICE_URL}/api/intent/classify")
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.post(
+                    f"{settings.INTENT_CLASSIFIER_SERVICE_URL}/api/intent/classify",
+                    json={"email_content": query.strip(), "subject": None, "from_email": None},
+                )
+                if resp.status_code == 200:
+                    out = resp.json()
+                    print(f"[INTENT] OK: intent={out.get('intent')} prefs={out.get('answer_preferences')}")
+                    return out
+                print(f"[INTENT] HTTP {resp.status_code}")
+        except Exception as e:
+            print(f"[INTENT] Error: {e}")
+            logger.debug(f"Intent classifier unavailable or error: {e}")
+        return None
+
+    @staticmethod
+    def _should_skip_orchestrator(
+        query: Optional[str],
+        origin_code: Optional[str],
+        destination_code: Optional[str],
+        container_type: Optional[str]
+    ) -> bool:
+        """True when we can skip orchestrator for latency: no port/container filters, and query is list/fact or not asking for long explanation."""
+        if origin_code or destination_code or container_type:
+            return False
+        if not query or not query.strip():
+            return False
+        if RateSheetService._has_long_answer_keywords(query):
+            return False
+        return True
+
+    @staticmethod
+    def _should_use_long_answer(
+        query: Optional[str],
+        intent_result: Optional[Dict[str, Any]],
+        exact_rates: List[Dict[str, Any]],
+        route_alternatives: List[Dict[str, Any]]
+    ) -> bool:
+        """
+        Use LONG only when the user explicitly asks to explain / compare / how-to / why.
+        For routes, costs, or any data question → always short/list. No long answer even if many rates.
+        """
+        if not query:
+            return False
+        if RateSheetService._is_list_or_fact_query(query):
+            return False
+        return RateSheetService._has_long_answer_keywords(query)
+
     async def search_rate_sheets(
         self,
         organization_id: int,
@@ -725,10 +826,12 @@ class RateSheetService:
             List of top 3 re-ranked rate sheets with similarity scores
         """
         try:
+            print(f"\n[RATE SHEET SEARCH] query={query!r} org={organization_id} carrier={carrier_name} origin={origin_code} dest={destination_code} container={container_type}")
             # FAST PATH: If no query and no filters requiring semantic search, skip AI processing
             # This significantly speeds up simple list requests
             has_semantic_filters = origin_code or destination_code or container_type
             if not query and not has_semantic_filters:
+                print("[RATE SHEET SEARCH] Path: FAST (no query) → return all rate sheets, no AI")
                 logger.info("Fast path: No query provided, skipping AI processing and returning all rate sheets")
                 # Get all rate sheets directly from vector DB (filtered by organization_id)
                 # Use a reasonable limit - most orgs won't have more than 1000 rate sheets
@@ -773,6 +876,7 @@ class RateSheetService:
                         "matching_data": {}
                     })
                 
+                print(f"[RATE SHEET SEARCH] Returning {len(formatted_results)} rate sheets (no AI)")
                 logger.info(f"Fast path: Returning {len(formatted_results)} rate sheets without AI processing")
                 return {
                     "answer": "",  # No AI answer for simple list
@@ -781,102 +885,289 @@ class RateSheetService:
                     "total_returned": min(len(formatted_results), limit)
                 }
             
-            # SLOW PATH: Use AI processing when there's a query or semantic filters
-            # Build search query
+            # SLOW PATH: Use agentic (Orchestrator) when there's a query, then re-rank + answer
             search_query = query or "rate sheet"
-            
-            # Add filters to query if provided
-            if carrier_name:
-                search_query += f" carrier {carrier_name}"
-            if origin_code:
-                search_query += f" origin {origin_code}"
-            if destination_code:
-                search_query += f" destination {destination_code}"
-            if container_type:
-                search_query += f" container {container_type}"
-            
-            # Build filters
-            filters = {}
-            if carrier_name:
-                filters["carrier_name"] = carrier_name
-            
-            # Stage 1: Vector search - get top 20 results
-            logger.info(f"Stage 1: Vector search for query: '{search_query}' (original: {query if query else 'None'})")
-            vector_results = await self.embedding_service.search_rate_sheets(
-                query=search_query,
-                organization_id=organization_id,
-                limit=20,  # Get top 20 for re-ranking
-                filters=filters
-            )
-            
-            if not vector_results:
-                logger.info("No results found in vector search")
-                return []
-            
-            # Format results with detailed matching data from sheets
-            formatted_results = []
             query_lower = query.lower() if query else ""
-            
-            for result in vector_results:
-                metadata = result.get("metadata", {})
-                document = result.get("document", "")
-                
-                # Apply additional filters
-                if origin_code and origin_code.lower() not in document.lower():
-                    continue
-                if destination_code and destination_code.lower() not in document.lower():
-                    continue
-                if container_type and container_type.lower() not in document.lower():
-                    continue
-                
-                # Extract matching rows/data from the full document
-                matching_data = self._extract_matching_data(document, query_lower)
-                
-                formatted_results.append({
-                    "id": result.get("id"),
-                    "file_name": metadata.get("file_name", ""),
-                    "carrier_name": metadata.get("carrier_name", ""),
-                    "title": metadata.get("title", ""),
-                    "rate_sheet_type": metadata.get("rate_sheet_type", ""),
-                    "status": metadata.get("status", ""),
-                    "similarity": result.get("similarity", 0),
-                    "distance": result.get("distance", 1),
-                    "metadata": metadata,
-                    "document": document,  # Full document for re-ranking
-                    "document_preview": document[:1000],  # Preview
-                    "matching_data": matching_data  # Specific matching rows/sections
-                })
-            
+
+            # --- Simple-query fast path (low latency): 1-3 words, no route/container filters → vector-only, no rerank, short answer ---
+            if self._is_simple_query(query, origin_code, destination_code, container_type):
+                print("[RATE SHEET SEARCH] Path: SIMPLE-QUERY (1-6 words, no filters) → vector-only, no orchestrator")
+                filters = {"carrier_name": carrier_name} if carrier_name else {}
+                vector_results = await self.embedding_service.search_rate_sheets(
+                    query=search_query,
+                    organization_id=organization_id,
+                    limit=10,
+                    filters=filters
+                )
+                formatted_fast = []
+                for result in vector_results:
+                    metadata = result.get("metadata", {})
+                    document = result.get("document", "")
+                    if carrier_name and (metadata.get("carrier_name") or "").lower() != carrier_name.lower():
+                        continue
+                    formatted_fast.append({
+                        "id": result.get("id"),
+                        "file_name": metadata.get("file_name", ""),
+                        "carrier_name": metadata.get("carrier_name", ""),
+                        "title": metadata.get("title", ""),
+                        "rate_sheet_type": metadata.get("rate_sheet_type", ""),
+                        "status": metadata.get("status", ""),
+                        "similarity": result.get("similarity", 0),
+                        "distance": result.get("distance", 1),
+                        "metadata": metadata,
+                        "document": document,
+                        "document_preview": document[:1000],
+                        "matching_data": self._extract_matching_data(document, query_lower)
+                    })
+                top_fast = formatted_fast[: min(5, limit)]
+                print(f"[RATE SHEET SEARCH] Simple path: vector returned {len(formatted_fast)} results, using top {len(top_fast)}")
+                intent_fast = await self._get_intent_for_query(query)
+                print(f"[RATE SHEET SEARCH] Intent (simple path): intent={intent_fast.get('intent') if intent_fast else None} prefs={intent_fast.get('answer_preferences') if intent_fast else None}")
+                fast_style = (intent_fast or {}).get("answer_preferences", {}).get("answer_format") or ("list" if self._is_list_or_fact_query(query) else "short")
+                print(f"[RATE SHEET SEARCH] Generating answer style={fast_style} (from intent or fallback)")
+                ai_answer_fast = await self.rerank_service.generate_answer(
+                    query=search_query, results=top_fast, answer_style=fast_style, intent_result=intent_fast
+                )
+                print(f"[RATE SHEET SEARCH] Simple path done → returning answer + {len(top_fast)} results")
+                logger.info(f"Simple-query fast path: {len(formatted_fast)} results, top {len(top_fast)}, short answer")
+                return {
+                    "answer": ai_answer_fast,
+                    "results": top_fast,
+                    "total_found": len(formatted_fast),
+                    "total_returned": len(top_fast),
+                }
+
+            # --- Vector-only path (skip orchestrator for latency): list/fact query, no port/container filters ---
+            if self._should_skip_orchestrator(query, origin_code, destination_code, container_type):
+                print("[RATE SHEET SEARCH] Path: VECTOR-ONLY (skip orchestrator) → vector + rerank + answer")
+                filters = {"carrier_name": carrier_name} if carrier_name else {}
+                vector_results = await self.embedding_service.search_rate_sheets(
+                    query=search_query,
+                    organization_id=organization_id,
+                    limit=10,
+                    filters=filters
+                )
+                formatted_v = []
+                for result in vector_results:
+                    metadata = result.get("metadata", {})
+                    document = result.get("document", "")
+                    if carrier_name and (metadata.get("carrier_name") or "").lower() != carrier_name.lower():
+                        continue
+                    formatted_v.append({
+                        "id": result.get("id"),
+                        "file_name": metadata.get("file_name", ""),
+                        "carrier_name": metadata.get("carrier_name", ""),
+                        "title": metadata.get("title", ""),
+                        "rate_sheet_type": metadata.get("rate_sheet_type", ""),
+                        "status": metadata.get("status", ""),
+                        "similarity": result.get("similarity", 0),
+                        "distance": result.get("distance", 1),
+                        "metadata": metadata,
+                        "document": document,
+                        "document_preview": document[:1000],
+                        "matching_data": self._extract_matching_data(document, query_lower)
+                    })
+                rerank_candidates_v = formatted_v[:8]
+                top_k_v = min(5, max(1, len(rerank_candidates_v)))
+                if len(rerank_candidates_v) > top_k_v:
+                    top_v = await self.rerank_service.rerank_results(
+                        query=query or search_query,
+                        results=rerank_candidates_v,
+                        top_k=top_k_v
+                    )
+                else:
+                    top_v = rerank_candidates_v[:top_k_v]
+                print(f"[RATE SHEET SEARCH] Vector-only: vector returned {len(formatted_v)} results, rerank top_k={top_k_v} → {len(top_v)} results")
+                intent_v = await self._get_intent_for_query(query)
+                print(f"[RATE SHEET SEARCH] Intent (vector-only): intent={intent_v.get('intent') if intent_v else None} prefs={intent_v.get('answer_preferences') if intent_v else None}")
+                vector_style = (intent_v or {}).get("answer_preferences", {}).get("answer_format") or ("list" if self._is_list_or_fact_query(query) else "short")
+                print(f"[RATE SHEET SEARCH] Generating answer style={vector_style} intent_result={'yes' if intent_v else 'no'}")
+                ai_answer_v = await self.rerank_service.generate_answer(
+                    query=search_query, results=top_v, answer_style=vector_style, intent_result=intent_v
+                )
+                print(f"[RATE SHEET SEARCH] Vector-only path done → returning answer + {len(top_v)} results")
+                logger.info(f"Vector-only path (no orchestrator): {len(formatted_v)} results, top {len(top_v)}, answer_style={vector_style}")
+                return {
+                    "answer": ai_answer_v,
+                    "results": top_v,
+                    "total_found": len(formatted_v),
+                    "total_returned": len(top_v),
+                }
+
+            # --- Agentic path: call Orchestrator (Intent + SQL + Graph + Vector) ---
+            print("[RATE SHEET SEARCH] Path: AGENTIC → calling Orchestrator (intent + SQL + graph + vector)")
+            formatted_results = []
+            exact_rates: List[Dict[str, Any]] = []
+            route_alternatives: List[Dict[str, Any]] = []
+            intent_result: Optional[Dict[str, Any]] = None
+            engines_used: Optional[Dict[str, bool]] = None
+
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.post(
+                        f"{settings.ORCHESTRATOR_SERVICE_URL}/api/orchestrator/query",
+                        params={"organization_id": organization_id},
+                        json={
+                            "email_content": search_query,
+                            "subject": None,
+                            "from_email": None
+                        }
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        intent_result = data.get("intent", {})
+                        engines_used = data.get("engines_used", {})
+                        combined = data.get("results", {})
+                        exact_rates = combined.get("exact_rates", [])
+                        route_alternatives = combined.get("route_alternatives", [])
+                        semantic_context = combined.get("semantic_context", [])
+                        print(f"[RATE SHEET SEARCH] Orchestrator OK: intent={intent_result.get('intent')} engines={engines_used} exact_rates={len(exact_rates)} semantic_context={len(semantic_context)}")
+
+                        # Filter semantic_context by organization_id (metadata may store as string)
+                        for item in semantic_context:
+                            meta = item.get("metadata", {})
+                            if str(meta.get("organization_id")) != str(organization_id):
+                                continue
+                            doc = item.get("content", "")
+                            if origin_code and origin_code.lower() not in doc.lower():
+                                continue
+                            if destination_code and destination_code.lower() not in doc.lower():
+                                continue
+                            if container_type and container_type.lower() not in doc.lower():
+                                continue
+                            if carrier_name and (meta.get("carrier_name") or "").lower() != carrier_name.lower():
+                                continue
+                            matching_data = self._extract_matching_data(doc, query_lower)
+                            formatted_results.append({
+                                "id": item.get("id"),
+                                "file_name": meta.get("file_name", ""),
+                                "carrier_name": meta.get("carrier_name", ""),
+                                "title": meta.get("title", ""),
+                                "rate_sheet_type": meta.get("rate_sheet_type", ""),
+                                "status": meta.get("status", ""),
+                                "similarity": 0,
+                                "distance": 0,
+                                "metadata": meta,
+                                "document": doc,
+                                "document_preview": doc[:1000],
+                                "matching_data": matching_data
+                            })
+                        logger.info(f"Agentic path: intent={intent_result.get('intent')}, exact_rates={len(exact_rates)}, semantic={len(formatted_results)}, engines={engines_used}")
+            except Exception as orch_err:
+                print(f"[RATE SHEET SEARCH] Orchestrator error: {orch_err} → fallback to vector-only")
+                logger.warning(f"Orchestrator unavailable or error, falling back to vector-only search: {orch_err}")
+
+            # Fallback: if agentic path returned no semantic results, use vector-only search
             if not formatted_results:
-                logger.info("No results after filtering")
-                return []
-            
-            # Stage 2: OpenAI re-ranking - get top 3 most relevant
-            logger.info(f"Stage 2: Re-ranking {len(formatted_results)} results with OpenAI")
+                print("[RATE SHEET SEARCH] Agentic returned 0 semantic results → fallback vector search")
+                # Build filters
+                if carrier_name:
+                    search_query += f" carrier {carrier_name}"
+                if origin_code:
+                    search_query += f" origin {origin_code}"
+                if destination_code:
+                    search_query += f" destination {destination_code}"
+                if container_type:
+                    search_query += f" container {container_type}"
+                filters = {"carrier_name": carrier_name} if carrier_name else {}
+
+                logger.info(f"Stage 1 (fallback): Vector search for query: '{search_query}' (limit=10 for latency)")
+                vector_results = await self.embedding_service.search_rate_sheets(
+                    query=search_query,
+                    organization_id=organization_id,
+                    limit=10,
+                    filters=filters
+                )
+                if not vector_results:
+                    return {
+                        "answer": "",
+                        "results": [],
+                        "total_found": 0,
+                        "total_returned": 0,
+                        "intent": intent_result,
+                        "engines_used": engines_used,
+                        "exact_rates": exact_rates,
+                        "route_alternatives": route_alternatives
+                    }
+
+                for result in vector_results:
+                    metadata = result.get("metadata", {})
+                    document = result.get("document", "")
+                    if origin_code and origin_code.lower() not in document.lower():
+                        continue
+                    if destination_code and destination_code.lower() not in document.lower():
+                        continue
+                    if container_type and container_type.lower() not in document.lower():
+                        continue
+                    matching_data = self._extract_matching_data(document, query_lower)
+                    formatted_results.append({
+                        "id": result.get("id"),
+                        "file_name": metadata.get("file_name", ""),
+                        "carrier_name": metadata.get("carrier_name", ""),
+                        "title": metadata.get("title", ""),
+                        "rate_sheet_type": metadata.get("rate_sheet_type", ""),
+                        "status": metadata.get("status", ""),
+                        "similarity": result.get("similarity", 0),
+                        "distance": result.get("distance", 1),
+                        "metadata": metadata,
+                        "document": document,
+                        "document_preview": document[:1000],
+                        "matching_data": matching_data
+                    })
+
+            if not formatted_results:
+                return {
+                    "answer": "",
+                    "results": [],
+                    "total_found": 0,
+                    "total_returned": 0,
+                    "intent": intent_result,
+                    "engines_used": engines_used,
+                    "exact_rates": exact_rates,
+                    "route_alternatives": route_alternatives
+                }
+
+            # Stage 2: Re-rank (cap at 8 candidates for latency; top_k up to 5, or 10 when user asks for "all routes")
+            rerank_candidates = formatted_results[:8]
+            q_lower = (query or "").lower()
+            want_all_routes = any(p in q_lower for p in ["all route", "every route", "provide all", "all the routes", "all routes", "list all"])
+            top_k = min(max(1, limit), len(rerank_candidates), 10 if want_all_routes else 5)
+            print(f"[RATE SHEET SEARCH] Stage 2: Re-rank candidates={len(rerank_candidates)} top_k={top_k} (want_all_routes={want_all_routes})")
+            logger.info(f"Stage 2: Re-ranking {len(rerank_candidates)} results with OpenAI, top_k={top_k}")
             top_results = await self.rerank_service.rerank_results(
                 query=query or search_query,
-                results=formatted_results,
-                top_k=3
+                results=rerank_candidates,
+                top_k=top_k
             )
-            
-            # Stage 3: Generate direct answer from the top results
-            logger.info(f"Stage 3: Generating direct answer from top {len(top_results)} results")
+
+            # Stage 3: Generate answer (list / short / long). List = routes+costs only, no prose.
+            answer_style = "list" if self._is_list_or_fact_query(query) else (
+                "long" if self._should_use_long_answer(
+                    query, intent_result, exact_rates, route_alternatives
+                ) else "short"
+            )
+            print(f"[RATE SHEET SEARCH] Stage 3: answer_style={answer_style} intent_result={'yes' if intent_result else 'no'} prefs={intent_result.get('answer_preferences') if intent_result else None}")
+            logger.info(f"Stage 3: Generating {answer_style} answer from top {len(top_results)} results")
             ai_answer = await self.rerank_service.generate_answer(
                 query=query or search_query,
-                results=top_results
+                results=top_results,
+                answer_style=answer_style,
+                intent_result=intent_result
             )
-            
-            # Each result now has its own individual ai_reasoning explaining why it's ranked in that position
-            logger.info(f"Re-ranking complete. Returning top {len(top_results)} results with individual reasoning and AI answer")
-            
+            print(f"[RATE SHEET SEARCH] Agentic path done → returning answer + {len(top_results)} results")
             return {
                 "answer": ai_answer,
                 "results": top_results,
                 "total_found": len(formatted_results),
-                "total_returned": len(top_results)
+                "total_returned": len(top_results),
+                "intent": intent_result,
+                "engines_used": engines_used,
+                "exact_rates": exact_rates,
+                "route_alternatives": route_alternatives
             }
         
         except Exception as e:
+            print(f"[RATE SHEET SEARCH] Error: {e}")
             logger.error(f"Error searching rate sheets: {e}")
             return []
     
