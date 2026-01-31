@@ -274,20 +274,19 @@ async def list_rate_sheets(
         "page_size": limit
     }
     
-    # Add answer if available
-    if answer:
-        response["answer"] = answer
-    
-    # Pass through agentic fields when present (rate sheet search via Orchestrator)
-    if isinstance(search_result, dict):
-        if search_result.get("intent") is not None:
-            response["intent"] = search_result["intent"]
-        if search_result.get("engines_used") is not None:
-            response["engines_used"] = search_result["engines_used"]
-        if search_result.get("exact_rates") is not None:
-            response["exact_rates"] = search_result["exact_rates"]
-        if search_result.get("route_alternatives") is not None:
-            response["route_alternatives"] = search_result["route_alternatives"]
+    # Only include answer and agentic fields when this was a search (query present), not a plain list
+    if query and query.strip():
+        if answer:
+            response["answer"] = answer
+        if isinstance(search_result, dict):
+            if search_result.get("intent") is not None:
+                response["intent"] = search_result["intent"]
+            if search_result.get("engines_used") is not None:
+                response["engines_used"] = search_result["engines_used"]
+            if search_result.get("exact_rates") is not None:
+                response["exact_rates"] = search_result["exact_rates"]
+            if search_result.get("route_alternatives") is not None:
+                response["route_alternatives"] = search_result["route_alternatives"]
     
     return response
 

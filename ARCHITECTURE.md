@@ -31,13 +31,13 @@ The system is a **microservices-based B2B SaaS** with:
 │ Auth │ │User  │ │Email │ │Vector│ │  AI  │ │Const │ │   RATE SHEET SERVICE        │
 │ 8001 │ │ 8006 │ │ 8005 │ │ 8004 │ │ 8003 │ │ 8002 │ │   8010                      │
 └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘ └──────┘ │  (calls internally:)        │
-   │        │        │        │        │               │  - Orchestrator 8013        │
-   │        │        │        │        │               │  - Intent Classifier 8012    │
-   ▼        ▼        │        ▼        │               │  - Decision Engine 8014     │
-┌──────┐ ┌──────┐   │   ┌──────┐   │   │               │  - Knowledge Graph 8011     │
-│ PG   │ │ PG   │   │   │Chroma│   │   │               │  - Vector DB 8004           │
-│auth_ │ │user_ │   │   │ (pkl)│   │   │               │  - AI 8003                  │
-│svc_db│ │svc_db│   │   └──────┘   │   │               └──────────────┬──────────────┘
+   │        │        │        │        │               │  - Orchestrator 8013       │
+   │        │        │        │        │               │  - Intent Classifier 8012  │
+   ▼        ▼        │        ▼        │               │  - Decision Engine 8014    │
+┌──────┐ ┌──────┐   │   ┌──────┐   │   │               │  - Knowledge Graph 8011    │
+│ PG   │ │ PG   │   │   │Chroma│   │   │               │  - Vector DB 8004          │
+│auth_ │ │user_ │   │   │ (pkl)│   │   │               │  - AI 8003                 │
+│svc_db│ │svc_db│   │   └──────┘   │   │               └──────────────┬─────────────┘
 └──────┘ └──────┘   │              │   │                            │
                     │              │   │               ┌──────────────┴──────────────┐
                     │   ┌──────────┴───┴───┐          │ PG rate_sheet_service_db    │
@@ -435,8 +435,8 @@ Upload runs the **four-stage pipeline** (see §4.6): Pandas normalization → AI
 | Step | Actor | Action |
 |------|--------|--------|
 | 1 | Frontend | `GET /api/rate-sheets/?organization_id=...&query=...&carrier_name=...&origin_code=...&destination_code=...&container_type=...&limit=50&page=1` |
-| 2 | Rate Sheet Service | **No query (fast path)**: Vector DB (embedding_service) with generic query; filters by organization_id and optional carrier. **With query (agentic path)**: calls Orchestrator (Intent + SQL + Graph + Vector), then re-rank and generate answer; returns intent, engines_used, exact_rates, route_alternatives when agentic |
-| 3 | Rate Sheet Service | Re-rank and generate_answer; returns rate_sheets, total, page, page_size, answer, and when agentic: intent, engines_used, exact_rates, route_alternatives. |
+| 2 | Rate Sheet Service | **No query (list path)**: Vector DB (embedding_service) with generic query; filters by organization_id and optional carrier. **With query (search/agentic path)**: calls Orchestrator (Intent + SQL + Graph + Vector), then re-rank and generate answer. |
+| 3 | Rate Sheet Service | **Response**: Always returns `rate_sheets`, `total`, `page`, `page_size`. **Only when `query` is present**: also returns `answer` and, when agentic, `intent`, `engines_used`, `exact_rates`, `route_alternatives`. List calls (no query) do not include `answer` or agentic fields. |
 
 #### 5.4.4 Get rate sheet by ID
 
