@@ -13,6 +13,7 @@ import os
 from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
 import logging
+import re
 import numpy as np
 import hashlib
 import httpx
@@ -1191,8 +1192,10 @@ class RateSheetService:
             "extracted_data": []  # Structured data extracted from matching rows
         }
         
+        # Normalize query terms: strip punctuation so "sheva?" matches "sheva" in the document
+        _strip_punctuation = lambda t: re.sub(r"^[?!.,;:\"\s]+|[?!.,;:\"\s]+$", "", t)
         query_terms = query.split()
-        query_terms_lower = [term.lower() for term in query_terms]
+        query_terms_lower = [_strip_punctuation(term).lower() for term in query_terms if _strip_punctuation(term)]
         
         # Split document into lines
         lines = document.split('\n')
@@ -1332,31 +1335,47 @@ class RateSheetService:
         rate_sheet_id: str,
         organization_id: int
     ) -> bool:
-        """Delete rate sheet from ChromaDB"""
+        """Delete rate sheet from all stores: PostgreSQL (structured + routes/pricing_tiers/surcharges), ChromaDB, and uploaded file on disk."""
         try:
             import httpx
-            
-            # Verify ownership first
-            rate_sheet = await self.get_rate_sheet(rate_sheet_id, organization_id)
-            if not rate_sheet:
-                return False
-            
-            # Delete from ChromaDB
+            from app.core.database import AsyncSessionLocal
+
+            # 1. Get PG record to verify ownership and get file_path for file deletion
+            async with AsyncSessionLocal() as db_session:
+                record = await self.structured_data_service.get_structured_data(db_session, rate_sheet_id, organization_id)
+                if not record:
+                    logger.warning(f"Rate sheet {rate_sheet_id} not found in PostgreSQL for org {organization_id}")
+                    return False
+                file_path = getattr(record, "file_path", None)
+
+                # 2. Delete from PostgreSQL (rate_sheet_structured_data + routes, pricing_tiers, surcharges)
+                pg_ok = await self.structured_data_service.delete_structured_data(db_session, rate_sheet_id, organization_id)
+                if not pg_ok:
+                    logger.error(f"Failed to delete rate sheet {rate_sheet_id} from PostgreSQL")
+                    return False
+
+            # 3. Delete from ChromaDB (vector store)
             from app.services.embedding_service import RATE_SHEETS_COLLECTION
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.delete(
                     f"{settings.VECTOR_DB_SERVICE_URL}/api/vector/collections/{RATE_SHEETS_COLLECTION}/documents/{rate_sheet_id}"
                 )
-                
-                if response.status_code == 200:
-                    logger.info(f"Deleted rate sheet {rate_sheet_id}")
-                    return True
-                else:
-                    logger.error(f"Failed to delete rate sheet: {response.text}")
-                    return False
-        
+                if response.status_code != 200:
+                    logger.warning(f"ChromaDB delete returned {response.status_code}: {response.text} (PG already deleted)")
+
+            # 4. Delete uploaded file on disk if path exists
+            if file_path and isinstance(file_path, str) and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    logger.info(f"Deleted uploaded file: {file_path}")
+                except OSError as e:
+                    logger.warning(f"Could not delete file {file_path}: {e}")
+
+            logger.info(f"Deleted rate sheet {rate_sheet_id} (PG + ChromaDB + file)")
+            return True
+
         except Exception as e:
-            logger.error(f"Error deleting rate sheet: {e}")
+            logger.error(f"Error deleting rate sheet: {e}", exc_info=True)
             return False
     
     async def reprocess_rate_sheet(

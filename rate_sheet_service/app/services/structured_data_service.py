@@ -73,6 +73,13 @@ class StructuredDataService:
             
             carrier_name = structured_data.get("carrier_name")
             
+            # Merge data_understanding (Cursor-style: what kind of data this sheet has) into additional_charges for storage
+            additional_charges = structured_data.get("additional_charges")
+            if isinstance(additional_charges, list):
+                additional_charges = {}
+            additional_charges = dict(additional_charges or {})
+            additional_charges["data_understanding"] = structured_data.get("data_understanding", {})
+            
             # Create structured data record (with JSONB columns for backward compat)
             structured_record = RateSheetStructuredData(
                 rate_sheet_id=rate_sheet_id,
@@ -87,7 +94,7 @@ class StructuredDataService:
                 routes_json=structured_data.get("routes", []),  # JSONB column
                 pricing_tiers_json=structured_data.get("pricing_tiers", []),  # JSONB column
                 surcharges_json=structured_data.get("surcharges", []),  # JSONB column
-                additional_charges=structured_data.get("additional_charges", []),
+                additional_charges=additional_charges,
                 valid_from=valid_from,
                 valid_to=valid_to,
                 effective_date=effective_date,
@@ -526,6 +533,31 @@ class StructuredDataService:
         except Exception as e:
             logger.error(f"Error getting structured data for {rate_sheet_id}: {e}")
             return None
+    
+    async def delete_structured_data(
+        self,
+        session: AsyncSession,
+        rate_sheet_id: str,
+        organization_id: int
+    ) -> bool:
+        """Delete rate sheet and all related data from PostgreSQL (routes, pricing_tiers, surcharges, rate_sheet_structured_data)."""
+        try:
+            # Verify record exists and belongs to org
+            record = await self.get_structured_data(session, rate_sheet_id, organization_id)
+            if not record:
+                return False
+            # Delete normalized child tables first (FK to rate_sheet_structured_data)
+            await session.execute(Route.__table__.delete().where(Route.rate_sheet_id == rate_sheet_id))
+            await session.execute(PricingTier.__table__.delete().where(PricingTier.rate_sheet_id == rate_sheet_id))
+            await session.execute(Surcharge.__table__.delete().where(Surcharge.rate_sheet_id == rate_sheet_id))
+            await session.delete(record)
+            await session.commit()
+            logger.info(f"✅ Deleted structured data for rate sheet {rate_sheet_id} (org {organization_id})")
+            return True
+        except Exception as e:
+            await session.rollback()
+            logger.error(f"Error deleting structured data for {rate_sheet_id}: {e}", exc_info=True)
+            return False
     
     def _normalize_port_name(self, port_name: str) -> str:
         """Normalize port name by removing country names, parentheses, and extra text"""

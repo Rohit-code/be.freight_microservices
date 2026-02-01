@@ -143,7 +143,8 @@ class PandasNormalizer:
                 "potential_carriers": set(),
                 "potential_origins": set(),
                 "potential_destinations": set(),
-                "potential_validity": {}
+                "potential_validity": {},
+                "potential_volume_data": False
             }
         }
         
@@ -287,6 +288,10 @@ class PandasNormalizer:
         if "POL" in full_text_upper and "POD" in full_text_upper:
             metadata["has_pol_pod"] = True
         
+        # Detect volume/projection data (like Cursor: understand what kind of data the sheet has)
+        volume_keywords = ["TOTAL TEUS", "LOCATION TARGET", "TOTAL TEU", "PORT OF DISCHARGE", "TARGET"]
+        metadata["has_volume_or_projection_data"] = any(kw in full_text_upper for kw in volume_keywords)
+        
         return metadata
     
     def _update_metadata(self, result: Dict, sheet_data: Dict):
@@ -297,6 +302,8 @@ class PandasNormalizer:
         result["detected_metadata"]["potential_destinations"].update(meta.get("destinations", []))
         if meta.get("validity") and not result["detected_metadata"]["potential_validity"]:
             result["detected_metadata"]["potential_validity"] = meta["validity"]
+        if meta.get("has_volume_or_projection_data"):
+            result["detected_metadata"]["potential_volume_data"] = True
     
     def _finalize_result(self, result: Dict) -> Dict:
         """Convert sets to lists for JSON serialization"""
@@ -308,6 +315,7 @@ class PandasNormalizer:
         logger.info(f"   Detected: carriers={result['detected_metadata']['potential_carriers']}")
         logger.info(f"   Detected: origins={result['detected_metadata']['potential_origins']}")
         logger.info(f"   Detected: destinations={result['detected_metadata']['potential_destinations']}")
+        logger.info(f"   Detected: potential_volume_data={result['detected_metadata'].get('potential_volume_data', False)}")
         
         return result
 
@@ -427,6 +435,7 @@ Extract ALL shipping rate data from the normalized Excel grid below.
 - Detected Origins: {normalized_data['detected_metadata'].get('potential_origins', [])}
 - Detected Destinations: {normalized_data['detected_metadata'].get('potential_destinations', [])}
 - Detected Validity: {normalized_data['detected_metadata'].get('potential_validity', {})}
+- Potential volume/projection data (TOTAL TEUS, LOCATION TARGET): {normalized_data['detected_metadata'].get('potential_volume_data', False)}
 
 ## NORMALIZED GRID DATA
 
@@ -464,6 +473,11 @@ Extract ALL pricing columns. Each rate sheet may have:
 - Section headers: "INDIAN SECTORS", "MIDDLE EAST", "FAR EAST"
 - Totals: "TOTAL", sum rows
 - Empty rows
+
+### 5. DATA UNDERSTANDING (like Cursor: understand what kind of data this sheet has)
+- **Rates-only sheet**: Contains only POL/POD, 20'/40' prices, transit, validity. No volume or container-count columns.
+- **Rates + volume/projection sheet**: Has columns like "TOTAL TEUS", "LOCATION TARGET", "20'" and "40'" as TARGET quantities (not prices), or "PORT OF DISCHARGE" with numeric targets. May have a row "TOTAL" with TEU counts.
+- If you see TOTAL TEUS, LOCATION TARGET, or numeric targets by location/period, set **contains_volume_or_projection_data** true and fill **volume_summary** with a short line (e.g. "Laem Chabang Jan 2026: 200 TEUs; Bangkok Jan 2026: 55 TEUs"). Otherwise set contains_volume_or_projection_data false and volume_summary null.
 
 ## REQUIRED OUTPUT FORMAT
 
@@ -521,9 +535,15 @@ Return ONLY valid JSON (no markdown, no explanation):
         }}
     ],
     "confidence_score": 95,
-    "extraction_notes": "Successfully extracted X routes"
+    "extraction_notes": "Successfully extracted X routes",
+    "data_understanding": {{
+        "contains_volume_or_projection_data": false,
+        "volume_summary": null
+    }}
 }}
 ```
+
+- **data_understanding**: Set contains_volume_or_projection_data true only if the sheet has volume/TEU/projection data (TOTAL TEUS, LOCATION TARGET, target quantities). Set volume_summary to a one-line summary (e.g. "Laem Chabang Jan 2026: 200 TEUs; Bangkok Jan 2026: 55 TEUs") or null if rates-only.
 
 ## CRITICAL REMINDERS
 1. Extract EVERY route with pricing
@@ -571,7 +591,13 @@ Return ONLY valid JSON (no markdown, no explanation):
             
             if json_start >= 0 and json_end > json_start:
                 json_str = content[json_start:json_end]
-                return json.loads(json_str)
+                data = json.loads(json_str)
+                # Default data_understanding (Cursor-style: what kind of data this sheet has)
+                data.setdefault("data_understanding", {
+                    "contains_volume_or_projection_data": False,
+                    "volume_summary": None
+                })
+                return data
             else:
                 raise ValueError("No JSON found in AI response")
                 
@@ -613,6 +639,8 @@ Return ONLY valid JSON (no markdown, no explanation):
         if len(routes) > 10:
             print(f"\n   ... and {len(routes) - 10} more routes")
         
+        du = extracted.get("data_understanding", {})
+        print(f"\n📊 DATA UNDERSTANDING: volume/projection={du.get('contains_volume_or_projection_data')} | summary={du.get('volume_summary')}")
         print(f"\n📝 EXTRACTION NOTES: {extracted.get('extraction_notes')}")
         print("=" * 80 + "\n")
         

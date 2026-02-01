@@ -77,6 +77,18 @@ class EmbeddingService:
         """
         parts = []
         
+        # ========== DATA UNDERSTANDING (like Cursor: what kind of data this sheet has) ==========
+        du = rate_sheet_data.get("data_understanding") or {}
+        has_volume = du.get("contains_volume_or_projection_data", False)
+        volume_summary = du.get("volume_summary") or ""
+        parts.append("=== DATA UNDERSTANDING ===")
+        parts.append("This rate sheet contains: freight rates by route.")
+        if has_volume and volume_summary:
+            parts.append(f"It also contains volume/projection data: {volume_summary}")
+        else:
+            parts.append("It does NOT contain volume or container-count data (no TOTAL TEUS, LOCATION TARGET, or projection targets).")
+        parts.append("")
+        
         # ========== AI-EXTRACTED STRUCTURED DATA ==========
         parts.append("=== AI-EXTRACTED STRUCTURED DATA ===")
         
@@ -96,6 +108,8 @@ class EmbeddingService:
         
         # ========== ALL ROUTES WITH ALL PRICING ==========
         routes = rate_sheet_data.get("routes", [])
+        if not isinstance(routes, list):
+            routes = []
         
         if routes:
             # Summary for quick reference
@@ -139,8 +153,10 @@ class EmbeddingService:
                 elif free_detention_text:
                     parts.append(f"  Free Detention: {free_detention_text}")
                 
-                # ALL pricing tiers - no truncation
+                # ALL pricing tiers - no truncation (handle non-list e.g. int from AI)
                 pricing_tiers = route.get("pricing_tiers", [])
+                if not isinstance(pricing_tiers, list):
+                    pricing_tiers = []
                 if pricing_tiers:
                     parts.append(f"  Pricing:")
                     for tier in pricing_tiers:
@@ -154,8 +170,10 @@ class EmbeddingService:
                             price_line += f" (VGM up to {vgm_max} MT)"
                         parts.append(price_line)
                         
-                        # Include surcharges if present (handle None)
+                        # Include surcharges if present (handle None or non-list e.g. int from AI)
                         surcharges = tier.get('surcharges') or []
+                        if not isinstance(surcharges, list):
+                            surcharges = []
                         if surcharges:
                             for surcharge in surcharges:
                                 if isinstance(surcharge, dict):
@@ -349,6 +367,8 @@ class EmbeddingService:
                 "created_at": metadata.get("created_at", ""),
                 "updated_at": metadata.get("updated_at", ""),
                 "processed_at": metadata.get("processed_at", ""),
+                "has_volume_data": str((rate_sheet_data.get("data_understanding") or {}).get("contains_volume_or_projection_data", False)),
+                "volume_summary": (rate_sheet_data.get("data_understanding") or {}).get("volume_summary") or "",
             }
             
             # Store in vector DB (same pattern as email service)

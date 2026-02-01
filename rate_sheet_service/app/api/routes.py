@@ -159,6 +159,86 @@ async def upload_rate_sheet_async(
         raise HTTPException(status_code=500, detail=f"Error uploading rate sheet: {error_details}")
 
 
+@router.post("/upload-multiple", status_code=202)
+async def upload_rate_sheets_multiple(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(..., description="One or more Excel/CSV files"),
+    organization_id: int = Query(...),
+    user_id: int = Query(...)
+):
+    """
+    Upload multiple rate sheet files at once (async).
+    
+    Each file is validated, a pending record is created, and processing runs in the background.
+    Poll GET /api/rate-sheets/{id}/status for each returned id to check completion.
+    
+    - **files**: One or more .xlsx, .xls, or .csv files (max 50MB each)
+    - **organization_id**: Organization ID
+    - **user_id**: User ID who uploaded
+    
+    Returns:
+        - uploaded: List of { id, file_name, status, message? }
+        - total: Number of files accepted
+    """
+    allowed_extensions = [".xlsx", ".xls", ".csv"]
+    max_size = 50 * 1024 * 1024  # 50MB per file
+    max_files = 20  # Limit concurrent uploads per request
+    if len(files) == 0:
+        raise HTTPException(status_code=400, detail="At least one file is required")
+    if len(files) > max_files:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Maximum {max_files} files per request. Got {len(files)}."
+        )
+    results = []
+    service = RateSheetService()
+    for f in files:
+        file_ext = "." + f.filename.split(".")[-1].lower() if "." in f.filename else ""
+        if file_ext not in allowed_extensions:
+            results.append({
+                "id": None,
+                "file_name": f.filename,
+                "status": "rejected",
+                "message": f"Invalid file type. Allowed: {', '.join(allowed_extensions)}"
+            })
+            continue
+        try:
+            file_content = await f.read()
+            if len(file_content) > max_size:
+                results.append({
+                    "id": None,
+                    "file_name": f.filename,
+                    "status": "rejected",
+                    "message": "File too large (max 50MB)"
+                })
+                continue
+            result = await service.upload_rate_sheet(
+                file_content=file_content,
+                file_name=f.filename,
+                organization_id=organization_id,
+                user_id=user_id,
+                async_mode=True,
+            )
+            rate_sheet_id = result["id"]
+            background_tasks.add_task(_process_rate_sheet_background, rate_sheet_id)
+            results.append({
+                "id": rate_sheet_id,
+                "file_name": f.filename,
+                "status": result.get("status", "pending"),
+                "message": result.get("message"),
+            })
+        except Exception as e:
+            error_details = str(e) if str(e) else repr(e)
+            logger.warning(f"Upload failed for {f.filename}: {error_details}")
+            results.append({
+                "id": None,
+                "file_name": f.filename,
+                "status": "failed",
+                "message": error_details,
+            })
+    return {"uploaded": results, "total": len(results)}
+
+
 async def _process_rate_sheet_background(rate_sheet_id: str):
     """Background task to process a rate sheet"""
     try:

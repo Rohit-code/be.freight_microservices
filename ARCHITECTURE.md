@@ -16,7 +16,7 @@ The system is a **microservices-based B2B SaaS** with:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              FRONTEND (Next.js, Port 3000)                        │
+│                              FRONTEND (Next.js, Port 3000)                      │
 └───────────────────────────────────────────┬─────────────────────────────────────┘
                                             │
                                             ▼
@@ -27,10 +27,10 @@ The system is a **microservices-based B2B SaaS** with:
 └───┬─────┬─────┬─────┬─────┬─────┬─────┬──────────────────────────────────────────┘
     │     │     │     │     │     │     │
     ▼     ▼     ▼     ▼     ▼     ▼     ▼
-┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌─────────────────────────────┐
-│ Auth │ │User  │ │Email │ │Vector│ │  AI  │ │Const │ │   RATE SHEET SERVICE        │
-│ 8001 │ │ 8006 │ │ 8005 │ │ 8004 │ │ 8003 │ │ 8002 │ │   8010                      │
-└──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘ └──────┘ │  (calls internally:)        │
+┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐  ┌────────────────────────────┐
+│ Auth │ │User  │ │Email │ │Vector│ │  AI  │ │Const │  │   RATE SHEET SERVICE       │
+│ 8001 │ │ 8006 │ │ 8005 │ │ 8004 │ │ 8003 │ │ 8002 │  │   8010                     │
+└──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘ └──────┘  │  (calls internally:)       │
    │        │        │        │        │               │  - Orchestrator 8013       │
    │        │        │        │        │               │  - Intent Classifier 8012  │
    ▼        ▼        │        ▼        │               │  - Decision Engine 8014    │
@@ -38,12 +38,12 @@ The system is a **microservices-based B2B SaaS** with:
 │ PG   │ │ PG   │   │   │Chroma│   │   │               │  - Vector DB 8004          │
 │auth_ │ │user_ │   │   │ (pkl)│   │   │               │  - AI 8003                 │
 │svc_db│ │svc_db│   │   └──────┘   │   │               └──────────────┬─────────────┘
-└──────┘ └──────┘   │              │   │                            │
+└──────┘ └──────┘   │              │   │                              │
                     │              │   │               ┌──────────────┴──────────────┐
-                    │   ┌──────────┴───┴───┐          │ PG rate_sheet_service_db    │
-                    └──►│ Vector DB 8004   │          │ ArangoDB freight_graph      │
-                        │ (emails + rate   │          │ ChromaDB rate_sheets        │
-                        │ _sheets in pkl) │          └────────────────────────────┘
+                    │   ┌──────────┴───┴───┐           │ PG rate_sheet_service_db    │
+                    └──►│ Vector DB 8004   │           │ ArangoDB freight_graph      │
+                        │ (emails + rate   │           │ ChromaDB rate_sheets        │
+                        │ _sheets in pkl)  │            └-────────────────────────────┘
                         └──────────────────┘
 ```
 
@@ -458,7 +458,7 @@ Upload runs the **four-stage pipeline** (see §4.6): Pandas normalization → AI
 | Step | Actor | Action |
 |------|--------|--------|
 | 1 | Frontend | `DELETE /api/rate-sheets/<rate_sheet_id>?organization_id=...` |
-| 2 | Rate Sheet Service | Verifies ownership (organization_id); deletes from **Vector DB** collection `rate_sheets` document by id; deletes from **PostgreSQL** (rate_sheet_structured_data and cascaded routes/pricing_tiers/surcharges); optionally removes from **ArangoDB** graph; returns 204 |
+| 2 | Rate Sheet Service | Verifies ownership via **PostgreSQL** (get structured record by rate_sheet_id + organization_id). Deletes from **PostgreSQL**: routes, pricing_tiers, surcharges, then rate_sheet_structured_data. Deletes from **Vector DB** collection `rate_sheets` document by id. Deletes the **uploaded file** on disk (file_path from PG record) if it exists. Returns 204. (ArangoDB graph cleanup is not implemented; graph nodes/edges for this rate sheet may remain.) |
 
 #### 5.4.7 Reprocess rate sheet / reprocess all / sync ChromaDB
 
