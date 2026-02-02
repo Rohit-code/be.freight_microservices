@@ -395,15 +395,17 @@ Return the JSON response now:"""
                 region_filter = "India"
         print(f"[GENERATE_ANSWER] style={style} use_list={use_list} use_short={use_short} include_validity={include_validity} container_filter={container_filter} list_all_routes={list_all_routes} sort_alphabetically={sort_alphabetically} region_filter={region_filter} asks_volume={asks_for_volume_or_throughput} (intent={'yes' if intent_result else 'no'})")
 
-        # Cursor-style: answer only from documents; if the question asks for data not present, say so clearly
+        # Cursor-style: behave like Cursor with a codebase – data below is the only source of truth
         _cursor_rules = (
-            "CRITICAL: Answer ONLY from the provided rate sheet data. Do not guess or invent figures. "
-            "If the user asks for information that is NOT present in the data (e.g. 'how many containers did X process', "
-            "container counts, TEUs processed, volume, throughput) and the provided documents only contain freight rates "
-            "(routes, 20'/40' prices, validity, carrier names), respond clearly in 1-2 sentences: "
-            "'The rate sheets provided do not contain volume or container-count data; they only include freight rates by route. "
-            "For container counts or TEUs you would need a different report or source.' "
-            "If the data DOES include TEUs, volume, or targets (e.g. TOTAL TEUS, LOCATION TARGET, projection numbers), use that to answer."
+            "You work like Cursor: the rate sheet data provided below is your ONLY source of truth. "
+            "Answer ONLY from that data. Do not guess, infer, or use external knowledge about ports or rates. "
+            "If the answer is not in the data, say so clearly (e.g. 'The provided rate sheets do not contain that route/port/rate.'). "
+            "Never invent a port name, route, or price. "
+            "When the user asks for 'all', 'list', or 'every' route/cost, scan the ENTIRE provided data and include every relevant item—do not sample or truncate. "
+            "Use markdown for structure when helpful (headers, bullets); no fluff like 'Overview', 'Understanding', or 'Conclusion' unless the user asked for explanation. "
+            "If the user asks for information not in the data (e.g. container counts, TEUs, volume, throughput) and the data only has freight rates, say: "
+            "'The rate sheets provided do not contain that; they only include freight rates by route.' "
+            "If the data DOES include TEUs, volume, or targets, use that to answer."
         )
 
         try:
@@ -503,7 +505,8 @@ Key Rate Information (each route shows origin PORT → destination):
                     instructions.append(f"CRITICAL: List ONLY routes where origin OR destination is in {region_filter}. Exclude all other routes.")
                 instructions.extend([
                     "Use ORIGIN PORT from the route data (e.g. PORT KLANG, LAEM CHABANG). Do NOT use carrier name (e.g. MAXICON) as origin.",
-                    "Output ONLY a compact list. Each line: origin PORT → destination (container): cost. No essays, no overviews.",
+                    "Format for clarity: GROUP BY ORIGIN PORT. Under each origin, list destinations with rates. Example: **SINGAPORE** then next lines: KOLKATA (20'): USD 750 | (40'): USD 1500; COLOMBO (20'): USD 1400 | (40'): USD 2800; etc. Then **PORT KLANG** and its destinations. Use blank line between origin groups. This makes the list scannable and avoids truncation.",
+                    "Do NOT truncate. Include EVERY route from the data. If the list is long, keep the grouped format so the full list fits and is readable.",
                 ])
                 if container_filter == "20'":
                     instructions.append("Filter to 20' only. Label each line (20'). Do not include 40' rates.")
@@ -521,21 +524,23 @@ Key Rate Information (each route shows origin PORT → destination):
                     instructions.append("Include validity (Valid From – Valid To) on every line. Format: origin → destination (20'): cost | Valid: from–to.")
                 instruction_block = " ".join(instructions)
                 content_slice = results_content[:10] if list_all_routes else results_content[:5]
-                # Allow enough tokens for a full route list (100+ lines)
-                max_tokens = 4096 if list_all_routes else 350
+                # Allow enough tokens for full route list; grouped-by-origin format is more compact
+                max_tokens = 8192 if list_all_routes else 350
                 volume_hint = "Note: The user is asking for volume/container count or TEUs; if the data does not contain that, say so clearly.\n\n" if asks_for_volume_or_throughput else ""
                 region_hint = ""
                 if region_filter and str(region_filter).lower() == "india":
                     region_hint = "IMPORTANT: The user asked for India only. Output ONLY routes where origin OR destination is an Indian port. Do NOT include COLOMBO, CHITTAGONG, DHAKA, KARACHI, JEBEL ALI, JEDDAH, JAKARTA, BANGKOK, etc. unless the other end is India.\n\n"
-                prompt = f"""{volume_hint}{region_hint}User query: "{query}"
+                prompt = f"""{volume_hint}{region_hint}Like Cursor: the data below is your only source. Scan it completely and list every route/cost that matches the query. Do not truncate.
+
+User query: "{query}"
 
 Rate sheet data (unified; do not refer to "Rate Sheet 1" or sheet-wise):
 {chr(10).join(content_slice)}
 
 Format instructions (follow exactly): {instruction_block}
 
-Output: compact list only. Follow any specific request in the user query (e.g. sorted, validity, 20' only, 40' only, all routes). FORBIDDEN: "Overview", "Understanding", "Conclusion", using carrier name as origin."""
-                system_content = _cursor_rules + "\n\nYou output only a list of routes and costs from the data. Follow the format instructions and the user's request (sorting, validity, container type, etc.). Use origin port never carrier name. No intros, no conclusions."
+Output: grouped-by-origin format (origin as header, then destinations with 20'/40' and costs). Include EVERY route from the data; do not cut off. Follow any specific request (sorted, validity, 20' only, 40' only). FORBIDDEN: "Overview", "Understanding", "Conclusion", using carrier name as origin."""
+                system_content = _cursor_rules + "\n\nLike Cursor: check ALL the data below and output every matching route and cost. Use grouped-by-origin format for readability. Do not truncate. Use origin port, never carrier name. No intros, no conclusions."
                 if region_filter and str(region_filter).lower() == "india":
                     system_content += " When the user asks for India, list ONLY routes that have an Indian port as origin or destination; exclude all other routes."
             elif use_short:
@@ -544,14 +549,16 @@ Output: compact list only. Follow any specific request in the user query (e.g. s
                 region_hint_short = ""
                 if region_filter and str(region_filter).lower() == "india":
                     region_hint_short = "CRITICAL – India only: The user asked for rates IN India. Consider ONLY routes where origin OR destination is an Indian port (NHAVA SHEVA, MUNDRA, PIPAVAV, CHENNAI, KATTUPALLI, KOLKATA, HALDIA, VIZAG, KOLKATTA). Do NOT give the globally cheapest (e.g. Singapore→Laem Chabang is Thailand, not India). The cheapest rate IN India is the minimum among routes that touch India.\n\n"
-                prompt = f"""{volume_hint}{region_hint_short}Query: "{query}"
+                prompt = f"""{volume_hint}{region_hint_short}Like Cursor: answer only from the data below. If the answer is not there, say so.
+
+Query: "{query}"
 
 Data (unified; do not say 'Rate Sheet 1' or sheet-wise):
 {chr(10).join(results_content[:3])}
 
-Reply in 1-3 lines only. Give the exact data asked (routes/costs or one number). No overview, no "Understanding", no conclusion, no sheet-by-sheet breakdown."""
+Reply in 1-3 lines. Give the exact data asked (routes/costs or one number). No fluff, no overview."""
                 max_tokens = 120
-                system_content = _cursor_rules + "\n\nYou give only the direct, concise answer from the data. One place. No sheet-wise breakdown, no overviews, no educational content. Maximum 1-3 short lines."
+                system_content = _cursor_rules + "\n\nLike Cursor: give only the direct answer from the data below. One place. No fluff, no overviews. Maximum 1-3 short lines. If the data does not contain the answer, say so."
                 if region_filter and str(region_filter).lower() == "india":
                     system_content += " When the user asks for 'cheapest/lowest rate IN India' or 'rate in India', answer using ONLY routes that have an Indian port as origin or destination; do not pick a route like Singapore→Laem Chabang (Thailand)."
             else:
@@ -627,7 +634,7 @@ Use this long format ONLY because the user explicitly asked to explain, compare,
 
 Provide your comprehensive, in-depth answer now:"""
                 max_tokens = 800
-                system_content = _cursor_rules + "\n\nYou are an expert freight forwarding consultant and trainer with 15+ years of industry experience. You provide comprehensive, in-depth, and highly detailed explanations based on rate sheet data. You excel at teaching complex concepts, providing step-by-step walkthroughs, and explaining the business context behind technical information. You synthesize information from multiple sources and present it in a professional, educational format that helps users become proficient. You provide extensive detail when questions ask for explanations, walkthroughs, or understanding - never oversimplify or provide only basic information when depth is requested."
+                system_content = _cursor_rules + "\n\nLike Cursor: base your answer only on the rate sheet data provided. You are an expert consultant; explain and teach from that data. Do not invent routes or figures. If something is not in the data, say so. Provide depth when the user asks for explanation or understanding."
             
             # Call OpenAI API to generate answer
             import asyncio
@@ -642,7 +649,7 @@ Provide your comprehensive, in-depth answer now:"""
                     {"role": "system", "content": system_content},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.0 if use_short else 0.7,
+                temperature=0.0 if (use_short or use_list) else 0.7,
                 max_tokens=max_tokens
             )
             
