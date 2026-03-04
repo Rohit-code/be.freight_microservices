@@ -479,7 +479,11 @@ Extract ALL pricing columns. Each rate sheet may have:
 - Totals: "TOTAL", sum rows
 - Empty rows
 
+<<<<<<< HEAD
 ### 6. DATA UNDERSTANDING (like Cursor: understand what kind of data this sheet has)
+=======
+### 5. DATA UNDERSTANDING (like Cursor: understand what kind of data this sheet has)
+>>>>>>> 01adec3f107df1e8b1d96d91d37e75674eea59bb
 - **Rates-only sheet**: Contains only POL/POD, 20'/40' prices, transit, validity. No volume or container-count columns.
 - **Rates + volume/projection sheet**: Has columns like "TOTAL TEUS", "LOCATION TARGET", "20'" and "40'" as TARGET quantities (not prices), or "PORT OF DISCHARGE" with numeric targets. May have a row "TOTAL" with TEU counts.
 - If you see TOTAL TEUS, LOCATION TARGET, or numeric targets by location/period, set **contains_volume_or_projection_data** true and fill **volume_summary** with a short line (e.g. "Laem Chabang Jan 2026: 200 TEUs; Bangkok Jan 2026: 55 TEUs"). Otherwise set contains_volume_or_projection_data false and volume_summary null.
@@ -508,9 +512,12 @@ Return ONLY valid JSON (no markdown, no explanation):
             "service_type": "FCL",
             "free_detention_days": 14,
             "remarks": "via PKG/SIN",
+<<<<<<< HEAD
             "vessel_name": null,
             "space_available": 20,
             "space_unit": "TEU",
+=======
+>>>>>>> 01adec3f107df1e8b1d96d91d37e75674eea59bb
             "pricing_tiers": [
                 {{
                     "container_type": "20'",
