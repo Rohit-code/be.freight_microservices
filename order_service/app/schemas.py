@@ -30,6 +30,13 @@ class OrderTrackingEventCreate(BaseModel):
     occurred_at: Optional[datetime] = None
 
 
+class OrderTrackingEventUpdate(BaseModel):
+    event_type: Optional[str] = None
+    description: Optional[str] = None
+    location: Optional[str] = None
+    occurred_at: Optional[datetime] = None
+
+
 class OrderTrackingEventResponse(BaseModel):
     id: int
     order_id: int
@@ -55,6 +62,7 @@ class OrderResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     tracking_events: list[OrderTrackingEventResponse] = []
+    containers: list["ContainerResponse"] = []
 
     class Config:
         from_attributes = True
@@ -74,3 +82,28 @@ class OrderListResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class ContainerCreate(BaseModel):
+    container_number: str
+    container_type: Optional[str] = None
+
+
+class ContainerUpdate(BaseModel):
+    container_number: Optional[str] = None
+    container_type: Optional[str] = None
+
+
+class ContainerResponse(BaseModel):
+    id: int
+    order_id: int
+    container_number: str
+    container_type: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+OrderResponse.model_rebuild()

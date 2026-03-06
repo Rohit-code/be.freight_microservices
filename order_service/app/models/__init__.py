@@ -1,3 +1,3 @@
-from app.models.order import Order, OrderTrackingEvent
+from app.models.order import Order, OrderTrackingEvent, Container
 
-__all__ = ["Order", "OrderTrackingEvent"]
+__all__ = ["Order", "OrderTrackingEvent", "Container"]

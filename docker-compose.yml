@@ -17,7 +17,7 @@ services:
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_MULTIPLE_DATABASES: auth_service_db,rate_sheet_service_db,email_service_db,user_service_db
+      POSTGRES_MULTIPLE_DATABASES: auth_service_db,rate_sheet_service_db,email_service_db,user_service_db,customer_service_db,order_service_db
     ports:
       - "5432:5432"
     volumes:
@@ -250,6 +250,65 @@ services:
     networks:
       - freight_network
 
+  order_service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: order_service
+        PORT: 8015
+    container_name: freight_order_service
+    restart: unless-stopped
+    ports:
+      - "8015:8015"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - DB_NAME=order_service_db
+      - JWT_SECRET=${JWT_SECRET:-your-super-secret-jwt-key-change-in-production}
+      - PORT=8015
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8015/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - freight_network
+
+  customer_service:
+    build:
+      context: .
+      args:
+        SERVICE_NAME: customer_service
+        PORT: 8016
+    container_name: freight_customer_service
+    restart: unless-stopped
+    ports:
+      - "8016:8016"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - DB_NAME=customer_service_db
+      - JWT_SECRET=${JWT_SECRET:-your-super-secret-jwt-key-change-in-production}
+      - USER_SERVICE_URL=http://user_service:8006
+      - PORT=8016
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8016/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - freight_network
+
   # =============================================================================
   # AGENTIC ARCHITECTURE SERVICES
   # =============================================================================
@@ -432,6 +491,8 @@ services:
       - EMAIL_SERVICE_URL=http://email_service:8005
       - USER_SERVICE_URL=http://user_service:8006
       - RATE_SHEET_SERVICE_URL=http://rate_sheet_service:8010
+      - ORDER_SERVICE_URL=http://order_service:8015
+      - CUSTOMER_SERVICE_URL=http://customer_service:8016
       - KNOWLEDGE_GRAPH_SERVICE_URL=http://knowledge_graph_service:8011
       - INTENT_CLASSIFIER_SERVICE_URL=http://intent_classifier_service:8012
       - ORCHESTRATOR_SERVICE_URL=http://orchestrator_service:8013
@@ -444,6 +505,8 @@ services:
       - vector_db
       - email_service
       - user_service
+      - order_service
+      - customer_service
       - rate_sheet_service
       - knowledge_graph_service
       - intent_classifier_service

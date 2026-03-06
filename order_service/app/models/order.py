@@ -19,6 +19,7 @@ class Order(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
     tracking_events = relationship("OrderTrackingEvent", back_populates="order", order_by="OrderTrackingEvent.occurred_at")
+    containers = relationship("Container", back_populates="order", cascade="all, delete-orphan")
 
 
 class OrderTrackingEvent(Base):
@@ -33,3 +34,16 @@ class OrderTrackingEvent(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     order = relationship("Order", back_populates="tracking_events")
+
+
+class Container(Base):
+    __tablename__ = "containers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("orders.id", ondelete="CASCADE"), nullable=False, index=True)
+    container_number = Column(String(64), nullable=False)
+    container_type = Column(String(32), nullable=True)  # e.g. 20GP, 40HC
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    order = relationship("Order", back_populates="containers")

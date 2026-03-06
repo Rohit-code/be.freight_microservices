@@ -4,14 +4,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.deps import get_current_user_id, get_current_user_id_or_customer_id, get_current_user_id_and_staff, verify_internal_api_key
-from app.models import Order, OrderTrackingEvent
+from app.models import Order, OrderTrackingEvent, Container
 from app.schemas import (
     OrderCreate,
     OrderCreateForUser,
     OrderResponse,
     OrderListResponse,
     OrderTrackingEventCreate,
+    OrderTrackingEventUpdate,
     OrderTrackingEventResponse,
+    ContainerCreate,
+    ContainerUpdate,
+    ContainerResponse,
 )
 
 router = APIRouter(prefix="/api/orders", tags=["orders"])
@@ -63,8 +67,8 @@ async def get_order(
             raise HTTPException(status_code=404, detail="Order not found")
     elif order.user_id != user_id:
         raise HTTPException(status_code=404, detail="Order not found")
-    # Load tracking_events (lazy load or explicit)
-    await db.refresh(order, ["tracking_events"])
+    # Load tracking_events and containers
+    await db.refresh(order, ["tracking_events", "containers"])
     events = sorted(order.tracking_events, key=lambda e: e.occurred_at or e.created_at)
     return OrderResponse(
         id=order.id,
@@ -89,6 +93,7 @@ async def get_order(
             )
             for e in events
         ],
+        containers=[ContainerResponse.model_validate(c) for c in order.containers],
     )
 
 
@@ -182,3 +187,150 @@ async def add_tracking_event(
     await db.commit()
     await db.refresh(event)
     return event
+
+
+@router.patch("/{order_id}/tracking/{event_id}", response_model=OrderTrackingEventResponse)
+async def update_tracking_event(
+    order_id: int,
+    event_id: int,
+    body: OrderTrackingEventUpdate,
+    user_id_and_staff: tuple[int, bool] = Depends(get_current_user_id_and_staff),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a tracking event. Allowed if current user is order owner or staff."""
+    user_id, is_staff = user_id_and_staff
+    result = await db.execute(select(Order).where(Order.id == order_id))
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.user_id != user_id and not is_staff:
+        raise HTTPException(status_code=403, detail="Not allowed to update tracking for this order")
+    event_result = await db.execute(
+        select(OrderTrackingEvent).where(
+            OrderTrackingEvent.id == event_id,
+            OrderTrackingEvent.order_id == order_id,
+        )
+    )
+    event = event_result.scalar_one_or_none()
+    if not event:
+        raise HTTPException(status_code=404, detail="Tracking event not found")
+    if body.event_type is not None:
+        event.event_type = body.event_type
+    if body.description is not None:
+        event.description = body.description
+    if body.location is not None:
+        event.location = body.location
+    if body.occurred_at is not None:
+        event.occurred_at = body.occurred_at
+    await db.commit()
+    await db.refresh(event)
+    return event
+
+
+@router.get("/{order_id}/containers", response_model=list[ContainerResponse])
+async def list_containers(
+    order_id: int,
+    user_id_and_customer_id: tuple[int | None, int | None] = Depends(get_current_user_id_or_customer_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """List containers for an order. Allowed if order belongs to current user (NVOCC) or current customer (portal)."""
+    user_id, customer_id = user_id_and_customer_id
+    result = await db.execute(select(Order).where(Order.id == order_id))
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if customer_id is not None:
+        if order.customer_id != customer_id:
+            raise HTTPException(status_code=404, detail="Order not found")
+    elif order.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Order not found")
+    await db.refresh(order, ["containers"])
+    return [ContainerResponse.model_validate(c) for c in order.containers]
+
+
+@router.post("/{order_id}/containers", status_code=201, response_model=ContainerResponse)
+async def create_container(
+    order_id: int,
+    body: ContainerCreate,
+    user_id_and_staff: tuple[int, bool] = Depends(get_current_user_id_and_staff),
+    db: AsyncSession = Depends(get_db),
+):
+    """Add a container to an order. Allowed if current user is order owner or staff."""
+    user_id, is_staff = user_id_and_staff
+    result = await db.execute(select(Order).where(Order.id == order_id))
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.user_id != user_id and not is_staff:
+        raise HTTPException(status_code=403, detail="Not allowed to add containers to this order")
+    container = Container(
+        order_id=order_id,
+        container_number=body.container_number.strip(),
+        container_type=body.container_type.strip() if body.container_type else None,
+    )
+    db.add(container)
+    await db.commit()
+    await db.refresh(container)
+    return container
+
+
+@router.patch("/{order_id}/containers/{container_id}", response_model=ContainerResponse)
+async def update_container(
+    order_id: int,
+    container_id: int,
+    body: ContainerUpdate,
+    user_id_and_staff: tuple[int, bool] = Depends(get_current_user_id_and_staff),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a container. Allowed if current user is order owner or staff."""
+    user_id, is_staff = user_id_and_staff
+    result = await db.execute(select(Order).where(Order.id == order_id))
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.user_id != user_id and not is_staff:
+        raise HTTPException(status_code=403, detail="Not allowed to update containers for this order")
+    c_result = await db.execute(
+        select(Container).where(
+            Container.id == container_id,
+            Container.order_id == order_id,
+        )
+    )
+    container = c_result.scalar_one_or_none()
+    if not container:
+        raise HTTPException(status_code=404, detail="Container not found")
+    if body.container_number is not None:
+        container.container_number = body.container_number.strip()
+    if body.container_type is not None:
+        container.container_type = body.container_type.strip() or None
+    await db.commit()
+    await db.refresh(container)
+    return container
+
+
+@router.delete("/{order_id}/containers/{container_id}", status_code=204)
+async def delete_container(
+    order_id: int,
+    container_id: int,
+    user_id_and_staff: tuple[int, bool] = Depends(get_current_user_id_and_staff),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a container. Allowed if current user is order owner or staff."""
+    user_id, is_staff = user_id_and_staff
+    result = await db.execute(select(Order).where(Order.id == order_id))
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.user_id != user_id and not is_staff:
+        raise HTTPException(status_code=403, detail="Not allowed to delete containers for this order")
+    c_result = await db.execute(
+        select(Container).where(
+            Container.id == container_id,
+            Container.order_id == order_id,
+        )
+    )
+    container = c_result.scalar_one_or_none()
+    if not container:
+        raise HTTPException(status_code=404, detail="Container not found")
+    await db.delete(container)
+    await db.commit()
